@@ -1,0 +1,16 @@
+{
+  "summary": {
+    "n_runs": 5,
+    "completion_rate": 0.0,
+    "median_lap_time": Infinity,
+    "mean_crashes": 0.0,
+    "max_checkpoints": 0
+  },
+  "config": {
+    "weights": "nav_v1.npz",
+    "module": null,
+    "seed": 42,
+    "runs": 5,
+    "duration": 60.0
+  }
+}
