@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Iteration artifacts (generated locally — not committed)
+data_*.npz
+nav_*.npz
+fig_*.png
+fig_*.jpg
+*.pt
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
