@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -51,16 +52,42 @@ def flatten_sensors(raw: dict) -> dict:
 
 
 def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0) -> dict:
-    """REST-polling control loop.
+    """REST-polling control loop with background sensor thread.
 
-    Replaces eval.py's run_policy() which depends on WS state messages that
-    the server never sends. Instead we poll GET /sensors at the target Hz and
-    send control commands over the already-open WebSocket.
+    A background thread continuously polls GET /sensors as fast as the network
+    allows (~4 Hz over a transatlantic link). The main control loop runs at the
+    target Hz using the most recently fetched sensor reading, decoupling control
+    frequency from REST latency.
     """
+    # ── Background sensor polling thread ─────────────────────────────────
+    sensor_lock = threading.Lock()
+    latest: list = [None]   # [sensors_dict | None]
+    stop_flag: list = [False]
+
+    def poll_loop():
+        while not stop_flag[0]:
+            try:
+                raw = client.get_sensors()
+                s = flatten_sensors(raw)
+                with sensor_lock:
+                    latest[0] = s
+            except Exception:
+                pass
+
+    poll_thread = threading.Thread(target=poll_loop, daemon=True)
+    poll_thread.start()
+
+    # Wait for first reading (already confirmed by run_one's load wait)
+    t_wait = time.time()
+    while latest[0] is None and time.time() - t_wait < 5.0:
+        time.sleep(0.05)
+
+    # ── Control loop ─────────────────────────────────────────────────────
     interval = 1.0 / hz
     start = time.time()
     steps = 0
     checkpoints_passed = 0
+    last_cp_idx: int | None = None
     crashes = 0
     last_pos = None
     stuck_streak = 0
@@ -71,25 +98,25 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
     while time.time() - start < duration:
         step_start = time.time()
 
-        try:
-            raw = client.get_sensors()
-            sensors = flatten_sensors(raw)
-        except Exception:
+        with sensor_lock:
+            sensors = latest[0]
+
+        if sensors is None:
             time.sleep(interval)
             continue
 
-        # Build a state dict matching the shape policy_fn expects
-        state = {
-            "sensors": sensors,
-            "position": sensors["position"],
-        }
+        state = {"sensors": sensors, "position": sensors["position"]}
 
-        # Checkpoint tracking — use checkpoint_index as a monotone counter
+        # Checkpoint tracking via checkpoint_index increments
         nav = sensors["navigation"]
-        cp = nav.get("checkpoints_completed", nav.get("checkpoint_index", 0)) or 0
-        checkpoints_passed = max(checkpoints_passed, cp)
+        cp_idx = nav.get("checkpoint_index", 0)
+        if last_cp_idx is None:
+            last_cp_idx = cp_idx
+        elif cp_idx != last_cp_idx:
+            checkpoints_passed += (cp_idx - last_cp_idx) % 8
+            last_cp_idx = cp_idx
 
-        # Stuck / speed heuristic
+        # Stuck heuristic
         sp = sensors["speed"]
         if sp < 0.3:
             stuck_streak += 1
@@ -97,7 +124,7 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
             max_stuck = max(max_stuck, stuck_streak)
             stuck_streak = 0
 
-        # Crash detection via position teleport (> 5 m in one frame)
+        # Crash detection — position teleport > 5 m
         pos = sensors["position"]
         if last_pos is not None and pos:
             dx = pos.get("x", 0) - last_pos.get("x", 0)
@@ -106,7 +133,6 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
                 crashes += 1
         last_pos = pos
 
-        # Policy inference + control
         throttle, steering = policy_fn(state)
         try:
             client.send_control_ws(throttle, steering)
@@ -118,18 +144,17 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
 
         steps += 1
 
-        # 1 Hz track sample
         now = time.time()
         if now >= next_log:
             track.append({"t": now - start, "position": pos, "speed": sp})
             next_log = now + 1.0
 
-        # Pace to target Hz
         elapsed_step = time.time() - step_start
         sleep_for = interval - elapsed_step
         if sleep_for > 0:
             time.sleep(sleep_for)
 
+    stop_flag[0] = True
     elapsed = time.time() - start
     return {
         "steps": steps,
