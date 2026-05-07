@@ -34,6 +34,22 @@ TARGET_CHECKPOINTS = 8
 BROWSER_LOAD_TIMEOUT = 20   # seconds to wait for browser to load & send first sensor reading
 
 
+def flatten_sensors(raw: dict) -> dict:
+    """Convert nested REST /sensors response to the flat dict sensors_to_input() expects."""
+    nav = raw.get("navigation", {})
+    ground = raw.get("ground", {})
+    return {
+        "speed": raw["speed"],
+        "heading_error": nav["heading_error"],
+        "checkpoint_distance": nav["distance"],
+        "rays": raw["rays"],
+        "ground_friction": ground.get("friction", 1.0),
+        # keep nested fields for checkpoint/crash tracking
+        "navigation": nav,
+        "position": raw.get("position", {}),
+    }
+
+
 def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0) -> dict:
     """REST-polling control loop.
 
@@ -56,7 +72,8 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
         step_start = time.time()
 
         try:
-            sensors = client.get_sensors()
+            raw = client.get_sensors()
+            sensors = flatten_sensors(raw)
         except Exception:
             time.sleep(interval)
             continue
@@ -64,16 +81,16 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
         # Build a state dict matching the shape policy_fn expects
         state = {
             "sensors": sensors,
-            "position": sensors.get("position", {}),
+            "position": sensors["position"],
         }
 
-        # Checkpoint tracking
-        nav = sensors.get("navigation") or {}
-        cp = nav.get("checkpoints_completed", 0) or 0
+        # Checkpoint tracking — use checkpoint_index as a monotone counter
+        nav = sensors["navigation"]
+        cp = nav.get("checkpoints_completed", nav.get("checkpoint_index", 0)) or 0
         checkpoints_passed = max(checkpoints_passed, cp)
 
         # Stuck / speed heuristic
-        sp = sensors.get("speed", 0.0)
+        sp = sensors["speed"]
         if sp < 0.3:
             stuck_streak += 1
         else:
@@ -81,7 +98,7 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
             stuck_streak = 0
 
         # Crash detection via position teleport (> 5 m in one frame)
-        pos = sensors.get("position") or {}
+        pos = sensors["position"]
         if last_pos is not None and pos:
             dx = pos.get("x", 0) - last_pos.get("x", 0)
             dz = pos.get("z", 0) - last_pos.get("z", 0)
@@ -167,7 +184,7 @@ def run_one(policy, seed: int, run_idx: int, total_runs: int,
     while time.time() < deadline:
         try:
             s = client.get_sensors()
-            if s and "speed" in s:
+            if s and "speed" in s and "navigation" in s:
                 ready = True
                 break
         except Exception:
