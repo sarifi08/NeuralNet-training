@@ -41,16 +41,9 @@ HZ = 20.0
 
 STUCK_SPEED         = 0.4
 STUCK_FRAMES        = 30      # ~1.5 s before triggering escape
-ESCAPE_REV_FRAMES   = 32      # ~1.6 s of reverse + hard turn
-ESCAPE_FWD_FRAMES   = 28      # ~1.4 s of forward push afterwards
-POST_ESCAPE_FRAMES  = 100     # ~5.0 s of detour bias — longer commitment
-
-# Professional-driver escape: like a 3-point turn. Reverse with a turn
-# (chosen direction), then drive forward with a turn that continues the
-# rotation in the SAME direction. If two escapes in a row fail to make
-# progress, force-flip direction on the third — don't keep retrying the
-# same way.
-PROGRESS_DELTA      = 4.0     # m of distance change to count as 'progress'
+ESCAPE_REV_FRAMES   = 30      # ~1.5 s of reverse + hard turn
+ESCAPE_FWD_FRAMES   = 20      # ~1.0 s of forward push afterwards
+POST_ESCAPE_FRAMES  = 60      # ~3.0 s of detour bias after each escape
 
 # Approach scaling — the closer the checkpoint, the tighter we steer.
 def steer_scale(distance: float) -> float:
@@ -126,40 +119,44 @@ def rule_drive(sensors: dict, post_escape_dir: float = 0.0,
     return float(throttle), float(steer)
 
 
-def pick_escape_dir(rays: np.ndarray) -> float:
-    """Decide which way the bot should rotate during escape.
+def escape_reverse(rays: np.ndarray) -> tuple[float, float]:
+    """Reverse with a hard turn toward the side that has more rear clearance."""
+    rays = np.asarray(rays, dtype=float)
+    rear_left  = float(rays[3])   # +135°
+    rear_right = float(rays[5])   # -135°
+    front_left  = float(rays[1])
+    front_right = float(rays[7])
 
-    -1 = rotate LEFT (front swings left, bot ends up facing leftwards)
-    +1 = rotate RIGHT
+    # Decide which way to swing the front during reverse.
+    # (Ackermann: while reversing, steer = +1 makes the front swing LEFT.)
+    # We want the front to end up pointing toward the more-open forward side.
+    if front_left + rear_left > front_right + rear_right:
+        steer = +1.0       # swing front to LEFT
+    else:
+        steer = -1.0       # swing front to RIGHT
+    return -0.8, steer
+
+
+def escape_forward(rays: np.ndarray) -> tuple[float, float, float]:
+    """After reversing, drive forward toward the most-open forward direction.
+
+    Returns (throttle, steer, chosen_dir) where chosen_dir is -1 (left),
+    +1 (right) or 0 — used to bias normal driving for a few seconds afterwards
+    so the bot doesn't swing straight back into the wall it just escaped from.
     """
     rays = np.asarray(rays, dtype=float)
-    left_score  = float(rays[1] + rays[2] + rays[3])   # +45° + +90° + +135°
-    right_score = float(rays[5] + rays[6] + rays[7])   # -135° + -90° + -45°
-    return -1.0 if left_score > right_score else +1.0
+    front       = float(rays[0])
+    front_left  = float(rays[1])
+    front_right = float(rays[7])
 
-
-def escape_reverse(rays: np.ndarray, escape_dir: float) -> tuple[float, float]:
-    """Reverse while rotating in the given direction.
-
-    Ackermann under reverse: steer = +1 (right wheel turn) drives the FRONT
-    of the bot to swing LEFT. So to rotate LEFT (escape_dir=-1), use steer=+1.
-    Formula: steer = -escape_dir.
-    """
-    return -0.85, float(-escape_dir)
-
-
-def escape_forward(rays: np.ndarray, escape_dir: float) -> tuple[float, float, float]:
-    """Drive forward continuing the same rotation as escape_reverse.
-
-    Forward + steer=+escape_dir continues the same rotation that the reverse
-    started. This completes the 3-point-turn: bot ends up facing roughly
-    perpendicular to its original heading, ideally on a clear side of the wall.
-    """
-    rays  = np.asarray(rays, dtype=float)
-    front = float(rays[0])
-    steer = 0.7 * float(escape_dir)
-    throttle = 0.85 if front > 5.0 else 0.55
-    return throttle, steer, float(escape_dir)
+    if front_left > front_right + 1.0:
+        steer, chosen_dir = -0.6, -1.0
+    elif front_right > front_left + 1.0:
+        steer, chosen_dir = +0.6, +1.0
+    else:
+        steer, chosen_dir = 0.0, 0.0
+    throttle = 0.85 if front > 4.0 else 0.6
+    return throttle, steer, chosen_dir
 
 
 def main():
@@ -231,13 +228,6 @@ def main():
     post_escape_frames = 0     # frames remaining of post-escape detour bias
     post_escape_dir    = 0.0   # +1 / -1 / 0 — direction the last escape committed to
 
-    # Force-flip tracking — if last escape made no progress, flip direction
-    # next time instead of repeating the same one.
-    last_escape_dir       = 0.0     # -1 / +1 — direction of last escape's rotation
-    distance_at_escape    = None    # checkpoint distance when last escape triggered
-    failed_escape_streak  = 0       # consecutive escapes without progress
-    current_escape_dir    = 0.0     # direction of currently-active escape
-
     cp_positions: dict[int, dict] = {}
     last_cp_idx: int | None       = None
 
@@ -257,11 +247,10 @@ def main():
         else:
             stuck_streak = 0
 
-        # Checkpoint position logging — also resets frustration state
-        nav      = sensors.get("navigation", {})
-        cp_idx   = nav.get("checkpoint_index", 0)
-        distance = float(nav.get("distance", 50.0))
-        pos      = sensors.get("position", {}) or {}
+        # Checkpoint position logging
+        nav    = sensors.get("navigation", {})
+        cp_idx = nav.get("checkpoint_index", 0)
+        pos    = sensors.get("position", {}) or {}
         if last_cp_idx is not None and cp_idx != last_cp_idx:
             cp_positions[int(cp_idx)] = {
                 "x": float(pos.get("x", 0.0)),
@@ -272,51 +261,29 @@ def main():
             print(f"  ★ next_cp now {cp_idx} — bot at "
                   f"({pos.get('x', 0):.1f}, {pos.get('z', 0):.1f}) "
                   f"t={time.time()-start:.1f}s")
-            # Made checkpoint progress — clear failure tracking
-            failed_escape_streak = 0
-            distance_at_escape   = None
-            last_escape_dir      = 0.0
         last_cp_idx = cp_idx
 
         rays = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
 
-        # Trigger an escape if we're stuck and not already in one
+        # Trigger escape if not already in one
         if escape_rev == 0 and escape_fwd == 0 and stuck_streak >= STUCK_FRAMES:
-            # Did the LAST escape make checkpoint progress?
-            last_failed = (
-                distance_at_escape is not None
-                and abs(distance - distance_at_escape) < PROGRESS_DELTA
-            )
-            if last_failed and last_escape_dir != 0.0:
-                # Force-flip: same wall trapped us twice with the same direction
-                current_escape_dir   = -last_escape_dir
-                failed_escape_streak += 1
-                print(f"  ↻ escape force-flipped to "
-                      f"{'LEFT' if current_escape_dir<0 else 'RIGHT'} "
-                      f"(streak={failed_escape_streak})  d={distance:.1f}m")
-            else:
-                # Pick by ray clearances
-                current_escape_dir   = pick_escape_dir(rays)
-                failed_escape_streak = 0
+            escape_rev = ESCAPE_REV_FRAMES
+            stuck_events += 1
+            stuck_streak = 0
 
-            distance_at_escape = distance
-            escape_rev         = ESCAPE_REV_FRAMES
-            stuck_events      += 1
-            stuck_streak       = 0
-
-        # Drive priority: escape_rev > escape_fwd > normal (with bias)
         if escape_rev > 0:
-            throttle, steer = escape_reverse(rays, current_escape_dir)
+            throttle, steer = escape_reverse(rays)
             escape_rev -= 1
             if escape_rev == 0:
                 escape_fwd = ESCAPE_FWD_FRAMES
         elif escape_fwd > 0:
-            throttle, steer, chosen_dir = escape_forward(rays, current_escape_dir)
+            throttle, steer, chosen_dir = escape_forward(rays)
             escape_fwd -= 1
             if escape_fwd == 0:
+                # Hand-off to normal driving with a fading detour bias toward
+                # the side this escape committed to.
                 post_escape_dir    = chosen_dir
                 post_escape_frames = POST_ESCAPE_FRAMES
-                last_escape_dir    = chosen_dir
         else:
             throttle, steer = rule_drive(sensors,
                                          post_escape_dir=post_escape_dir,
@@ -336,15 +303,16 @@ def main():
         if steps % 200 == 0:
             elapsed = time.time() - start
             if escape_rev:
-                mode = f"ESC-REV{'L' if current_escape_dir<0 else 'R'}"
+                mode = "ESC-REV"
             elif escape_fwd:
-                mode = f"ESC-FWD{'L' if current_escape_dir<0 else 'R'}"
+                mode = "ESC-FWD"
             elif post_escape_frames > 0:
                 mode = f"BIAS{int(post_escape_dir):+d}"
             else:
-                mode = "drive   "
-            print(f"  t={elapsed:4.0f}s  spd={sp:4.1f}  cp={cp_idx}  d={distance:5.1f}m  "
-                  f"steps={steps}  esc={stuck_events}  flips={failed_escape_streak}  "
+                mode = "drive  "
+            dist = sensors.get("navigation", {}).get("distance", -1.0)
+            print(f"  t={elapsed:4.0f}s  spd={sp:4.1f}  cp={cp_idx}  d={dist:5.1f}m  "
+                  f"steps={steps}  esc={stuck_events}  "
                   f"mode={mode}  thr={throttle:+.2f} str={steer:+.2f}")
 
         elapsed_step = time.time() - step_start
