@@ -83,6 +83,9 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
         time.sleep(0.05)
 
     # ── Control loop ─────────────────────────────────────────────────────
+    STUCK_THRESHOLD = 30    # frames at speed < 0.3 before recovery kicks in (~1.5s)
+    RECOVERY_FRAMES = 25    # frames of reverse + counter-steer (~1.2s)
+
     interval = 1.0 / hz
     start = time.time()
     steps = 0
@@ -92,6 +95,8 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
     last_pos = None
     stuck_streak = 0
     max_stuck = 0
+    recovery_counter = 0    # >0 means we're in recovery mode
+    last_policy_steering = 0.0
     track = []
     next_log = start
 
@@ -133,7 +138,26 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
                 crashes += 1
         last_pos = pos
 
-        throttle, steering = policy_fn(state)
+        # Policy or stuck-recovery override
+        if recovery_counter > 0:
+            # Reverse with counter-steer to break free from obstacle
+            throttle = -0.6
+            steering = -last_policy_steering
+            recovery_counter -= 1
+            if recovery_counter == 0:
+                stuck_streak = 0
+                if hasattr(policy_fn, "reset"):
+                    policy_fn.reset()
+        elif stuck_streak >= STUCK_THRESHOLD:
+            # Trigger recovery
+            recovery_counter = RECOVERY_FRAMES
+            throttle = -0.6
+            steering = -last_policy_steering
+            stuck_streak = 0
+        else:
+            throttle, steering = policy_fn(state)
+            last_policy_steering = steering
+
         try:
             client.send_control_ws(throttle, steering)
         except Exception:
