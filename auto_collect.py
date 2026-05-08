@@ -22,7 +22,8 @@ from game_client import GameClient
 SERVER_URL = "https://ml.ferit.tech"
 HZ = 20.0
 STUCK_THRESHOLD = 35    # frames at speed < 0.5 before reversing (~1.75s)
-RECOVERY_FRAMES = 22    # frames of reverse (~1.1s)
+RECOVERY_FRAMES = 28    # frames of reverse (~1.4s)
+ESCAPE_FRAMES   = 18    # frames of forward+hard-turn after reversing (~0.9s)
 
 
 def rule_drive(sensors: dict) -> tuple[float, float]:
@@ -126,12 +127,15 @@ def main():
 
     threading.Thread(target=poll, daemon=True).start()
 
-    interval    = 1.0 / HZ
-    start       = time.time()
-    steps       = 0
+    interval      = 1.0 / HZ
+    start         = time.time()
+    steps         = 0
     stuck_streak  = 0
     recovery_cnt  = 0
+    escape_cnt    = 0
     last_steer    = 0.0
+    recovery_dir  = 1.0   # alternates ±1 each stuck event so bot escapes different sides
+    stuck_events  = 0
 
     while time.time() - start < duration:
         step_start = time.time()
@@ -150,10 +154,23 @@ def main():
             stuck_streak = 0
 
         if recovery_cnt > 0:
-            throttle, steer = -0.7, float(np.clip(-last_steer, -1, 1))
+            # Reverse with a hard turn in the alternating direction to swing around obstacle
+            throttle = -0.7
+            steer = float(recovery_dir * 0.9)
             recovery_cnt -= 1
+            if recovery_cnt == 0:
+                escape_cnt = ESCAPE_FRAMES
+        elif escape_cnt > 0:
+            # After reversing: drive forward with hard turn to clear the obstacle
+            throttle = 0.6
+            steer = float(-recovery_dir * 0.85)
+            escape_cnt -= 1
         elif stuck_streak >= STUCK_THRESHOLD:
-            throttle, steer = -0.7, float(np.clip(-last_steer, -1, 1))
+            stuck_events += 1
+            # Flip direction every stuck event so we try both sides
+            recovery_dir = 1.0 if stuck_events % 2 == 1 else -1.0
+            throttle = -0.7
+            steer = float(recovery_dir * 0.9)
             recovery_cnt = RECOVERY_FRAMES
             stuck_streak = 0
         else:
@@ -174,7 +191,7 @@ def main():
             nav = sensors.get("navigation", {})
             cp  = nav.get("checkpoint_index", "?")
             print(f"  t={elapsed:4.0f}s  speed={sp:4.1f}  next_cp={cp}  "
-                  f"steps={steps}  stuck={stuck_streak}")
+                  f"steps={steps}  stuck_streak={stuck_streak}  recoveries={stuck_events}")
 
         elapsed_step = time.time() - step_start
         sleep_for = interval - elapsed_step
