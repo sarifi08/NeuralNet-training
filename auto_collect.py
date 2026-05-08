@@ -1,16 +1,25 @@
-"""Autonomous data collection via rule-based controller.
+"""Autonomous data collection via Follow-The-Gap controller.
 
-A hand-coded controller generates clean (sensor, action) pairs with
-correct heading_error -> steering correlation — something human visual
-driving cannot reliably produce. Just open the browser so the physics
-runs; this script drives the bot.
+Algorithm (FGM, used by F1Tenth racing bots):
+  For each forward ray, score = clearance * 0.55 + alignment_to_checkpoint * 0.45.
+  Pick the highest-scoring ray and steer toward its angle.
+
+This avoids the oscillation of "heading + wall-push" controllers because the
+controller commits to the most-open forward direction instead of fighting two
+simultaneous corrections.
+
+When stuck, an "informed escape" reads all 8 rays and reverses or pivots
+toward the actually-open direction — no hard-coded ±0.9 bias.
+
+Also logs the world-space position of each checkpoint as the bot passes it.
 
 Usage:
-    python auto_collect.py --tag v5_auto --seed 42 --minutes 6
-    python auto_collect.py --tag v5_s7  --seed 7  --minutes 4
+    python auto_collect.py --tag v6_s7 --seed 7 --minutes 5
+    python auto_collect.py --tag v6_s99 --seed 99 --minutes 5
 """
 from __future__ import annotations
 import argparse
+import json
 import threading
 import time
 import webbrowser
@@ -21,76 +30,147 @@ from game_client import GameClient
 
 SERVER_URL = "https://ml.ferit.tech"
 HZ = 20.0
-STUCK_THRESHOLD = 35    # frames at speed < 0.5 before reversing (~1.75s)
-RECOVERY_FRAMES = 28    # frames of reverse (~1.4s)
-ESCAPE_FRAMES   = 18    # frames of forward+hard-turn after reversing (~0.9s)
+
+# 8-ray sensor: angle in bot frame (positive = LEFT, negative = RIGHT).
+# Indices match the existing code's comments (rays[1,2] = +45,+90; rays[6,7] = -90,-45).
+RAY_ANGLES = np.array([
+    0.0,           # 0: front
+    np.pi / 4,     # 1: front-left  (+45°)
+    np.pi / 2,     # 2: left        (+90°)
+    3 * np.pi / 4, # 3: rear-left   (+135°)
+    np.pi,         # 4: rear        (180°)
+   -3 * np.pi / 4, # 5: rear-right  (-135°)
+   -np.pi / 2,     # 6: right       (-90°)
+   -np.pi / 4,     # 7: front-right (-45°)
+])
+
+# Indices considered "forward" for path-finding (in priority order)
+FORWARD_RAYS = [0, 1, 7, 2, 6]    # front, ±45°, ±90°
+REAR_RAYS    = [4, 3, 5]          # rear, ±135°
+
+CLEARANCE_MIN = 4.5    # m; reject directions with less clearance than this
+STUCK_SPEED   = 0.4
+STUCK_FRAMES  = 25     # ~1.25 s before triggering escape
+ESCAPE_FRAMES = 30     # ~1.5 s of escape behaviour before resuming normal
+
+
+def follow_the_gap(rays: np.ndarray, target_angle: float) -> tuple[float, float]:
+    """Pick the forward ray maximising clearance × alignment with target.
+
+    target_angle: desired direction in bot frame (positive = left).
+    Returns (chosen_angle_radians, chosen_clearance_metres).
+    """
+    best_score     = -1e9
+    best_angle     = target_angle
+    best_clearance = 0.0
+
+    for i in FORWARD_RAYS:
+        a = float(RAY_ANGLES[i])
+        d = float(rays[i])
+        if d < CLEARANCE_MIN:
+            continue
+        clearance = min(d / 25.0, 1.0)
+        align     = (np.cos(a - target_angle) + 1.0) / 2.0   # 0..1
+        score     = 0.55 * clearance + 0.45 * align
+        if score > best_score:
+            best_score     = score
+            best_angle     = a
+            best_clearance = d
+
+    return best_angle, best_clearance
 
 
 def rule_drive(sensors: dict) -> tuple[float, float]:
-    """Rule-based controller with guaranteed correct sign convention.
+    """FGM-based controller. No directional bias."""
+    nav      = sensors.get("navigation", {})
+    he       = float(nav.get("heading_error", 0.0))      # +left, -right
+    rays     = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
+    friction = sensors.get("ground", {}).get("friction", 1.0)
 
-    heading_error < 0  ->  checkpoint is to the RIGHT  ->  steer right (+)
-    heading_error > 0  ->  checkpoint is to the LEFT   ->  steer left  (-)
-    """
-    nav    = sensors.get("navigation", {})
-    he     = nav.get("heading_error", 0.0)
-    rays   = sensors.get("rays", [50.0] * 8)
-    ground = sensors.get("ground", {})
-    friction = ground.get("friction", 1.0)
+    # Target direction in bot frame, capped to ±90° (only forward arc matters)
+    target = float(np.clip(he, -np.pi / 2, np.pi / 2))
 
-    # Primary: proportional heading correction
-    steer = float(np.clip(-he / np.pi, -1.0, 1.0))
+    chosen_angle, _ = follow_the_gap(rays, target)
 
-    # Additive wall-avoidance corrections
-    front      = rays[0]
-    left_near  = min(rays[1], rays[2])   # ray +45, +90
-    right_near = min(rays[6], rays[7])   # ray -90, -45
+    # Convert bot-frame angle to steering [-1, 1].
+    # Convention here: positive steer = right; positive angle (left) ⇒ negative steer.
+    steer = float(np.clip(-chosen_angle / (np.pi / 2), -1.0, 1.0))
 
-    if left_near < 12:
-        steer += (12 - left_near) / 12 * 0.55   # push right
-    if right_near < 12:
-        steer -= (12 - right_near) / 12 * 0.55  # push left
-    steer = float(np.clip(steer, -1.0, 1.0))
-
-    # Throttle: ease off when badly off-heading or near a wall
-    if front < 6:
-        throttle = 0.10
-    elif abs(he) > 1.5:
-        throttle = 0.40
-    elif front < 18 or min(left_near, right_near) < 6:
-        throttle = 0.55
+    # Throttle: only slow down for genuinely close obstacles
+    front = float(rays[0])
+    if front < 5.0:
+        throttle = 0.30
+    elif front < 10.0:
+        throttle = 0.60
     else:
-        throttle = 0.85
+        throttle = 0.90
+
+    # When the chosen direction is far from the desired direction, the bot is
+    # making a tight evasive turn — ease throttle slightly so it doesn't
+    # understeer into a wall.
+    if abs(chosen_angle - target) > 0.7:
+        throttle *= 0.75
 
     if friction < 0.4:
-        throttle *= 0.75
+        throttle *= 0.65
 
     return float(throttle), float(steer)
 
 
+def informed_escape(rays: np.ndarray) -> tuple[float, float]:
+    """Stuck → look at all rays, head toward the most-open direction.
+
+    If a forward ray has clearance > 5.5 m: drive forward toward that ray.
+    Else reverse toward whichever rear ray is most open.
+    """
+    rays = np.asarray(rays, dtype=float)
+
+    # Best forward option
+    fwd_idx     = max(FORWARD_RAYS, key=lambda i: rays[i])
+    fwd_clear   = float(rays[fwd_idx])
+    if fwd_clear > 5.5:
+        a     = float(RAY_ANGLES[fwd_idx])
+        steer = float(np.clip(-a / (np.pi / 2), -1.0, 1.0))
+        return 0.65, steer
+
+    # Reverse toward the most-open rear ray
+    rear_idx   = max(REAR_RAYS, key=lambda i: rays[i])
+    rear_angle = float(RAY_ANGLES[rear_idx])
+    # When reversing, steer-direction is inverted relative to the desired
+    # rear-swing. To make the rear go LEFT (positive angle), use steer = +1.
+    if rear_angle > 0.5:        # rear-left is most open
+        steer = +1.0
+    elif rear_angle < -0.5:     # rear-right is most open
+        steer = -1.0
+    else:                        # straight back
+        steer = 0.0
+    return -0.65, steer
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag",     default="v5_auto")
-    ap.add_argument("--seed",    type=int, default=42)
-    ap.add_argument("--minutes", type=float, default=6.0)
+    ap.add_argument("--tag",     default="v6_auto")
+    ap.add_argument("--seed",    type=int,   default=42)
+    ap.add_argument("--minutes", type=float, default=5.0)
     args = ap.parse_args()
 
     duration = args.minutes * 60.0
 
-    client = GameClient(SERVER_URL)
+    client  = GameClient(SERVER_URL)
     session = client.create_session(
         mode="time_trial",
-        player_name=f"rule_{args.tag}",
+        player_name=f"fgm_{args.tag}",
         config={"seed": args.seed, "wind_enabled": False},
     )
-    browser_url = session.get("browser_url",
-                              f"{SERVER_URL}/?session={session['session_id']}")
+    browser_url = session.get(
+        "browser_url",
+        f"{SERVER_URL}/?session={session['session_id']}",
+    )
     print(f"\nOpening browser: {browser_url}")
     webbrowser.open(browser_url)
-    print("Waiting 8s for simulation to load…")
+    print("Waiting 8 s for simulation to load…")
     time.sleep(8)
 
-    # Confirm sensors are live
     print("Checking sensors…", end="", flush=True)
     for _ in range(20):
         try:
@@ -111,7 +191,6 @@ def main():
     client.start_recording(sample_rate=20)
     print(f"Recording started — driving for {args.minutes:.1f} min on seed {args.seed}…\n")
 
-    # Background sensor polling thread
     sensor_lock = threading.Lock()
     latest: list = [None]
     stop_flag: list = [False]
@@ -127,15 +206,15 @@ def main():
 
     threading.Thread(target=poll, daemon=True).start()
 
-    interval      = 1.0 / HZ
-    start         = time.time()
-    steps         = 0
-    stuck_streak  = 0
-    recovery_cnt  = 0
-    escape_cnt    = 0
-    last_steer    = 0.0
-    recovery_dir  = 1.0   # alternates ±1 each stuck event so bot escapes different sides
-    stuck_events  = 0
+    interval     = 1.0 / HZ
+    start        = time.time()
+    steps        = 0
+    stuck_streak = 0
+    escape_cnt   = 0
+    stuck_events = 0
+
+    cp_positions: dict[int, dict] = {}
+    last_cp_idx: int | None       = None
 
     while time.time() - start < duration:
         step_start = time.time()
@@ -147,35 +226,42 @@ def main():
             time.sleep(interval)
             continue
 
-        sp = sensors.get("speed", 0.0)
-        if sp < 0.5:
+        sp = float(sensors.get("speed", 0.0))
+        if sp < STUCK_SPEED:
             stuck_streak += 1
         else:
             stuck_streak = 0
 
-        if recovery_cnt > 0:
-            # Reverse with a hard turn in the alternating direction to swing around obstacle
-            throttle = -0.7
-            steer = float(recovery_dir * 0.9)
-            recovery_cnt -= 1
-            if recovery_cnt == 0:
-                escape_cnt = ESCAPE_FRAMES
-        elif escape_cnt > 0:
-            # After reversing: drive forward with hard turn to clear the obstacle
-            throttle = 0.6
-            steer = float(-recovery_dir * 0.85)
-            escape_cnt -= 1
-        elif stuck_streak >= STUCK_THRESHOLD:
+        # Checkpoint position logging
+        nav    = sensors.get("navigation", {})
+        cp_idx = nav.get("checkpoint_index", 0)
+        pos    = sensors.get("position", {}) or {}
+        if last_cp_idx is not None and cp_idx != last_cp_idx:
+            if cp_idx not in cp_positions:
+                cp_positions[cp_idx] = {
+                    "x": float(pos.get("x", 0.0)),
+                    "y": float(pos.get("y", 0.0)),
+                    "z": float(pos.get("z", 0.0)),
+                    "t": time.time() - start,
+                }
+                print(f"  ★ checkpoint {cp_idx} hit at "
+                      f"({pos.get('x', 0):.1f}, {pos.get('z', 0):.1f}) "
+                      f"t={time.time()-start:.1f}s")
+        last_cp_idx = cp_idx
+
+        rays = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
+
+        # Trigger / continue escape
+        if escape_cnt == 0 and stuck_streak >= STUCK_FRAMES:
+            escape_cnt = ESCAPE_FRAMES
             stuck_events += 1
-            # Flip direction every stuck event so we try both sides
-            recovery_dir = 1.0 if stuck_events % 2 == 1 else -1.0
-            throttle = -0.7
-            steer = float(recovery_dir * 0.9)
-            recovery_cnt = RECOVERY_FRAMES
             stuck_streak = 0
+
+        if escape_cnt > 0:
+            throttle, steer = informed_escape(rays)
+            escape_cnt -= 1
         else:
             throttle, steer = rule_drive(sensors)
-            last_steer = steer
 
         try:
             client.send_control_ws(throttle, steer)
@@ -186,15 +272,14 @@ def main():
                 pass
 
         steps += 1
-        if steps % 300 == 0:
+        if steps % 200 == 0:
             elapsed = time.time() - start
-            nav = sensors.get("navigation", {})
-            cp  = nav.get("checkpoint_index", "?")
-            print(f"  t={elapsed:4.0f}s  speed={sp:4.1f}  next_cp={cp}  "
-                  f"steps={steps}  stuck_streak={stuck_streak}  recoveries={stuck_events}")
+            print(f"  t={elapsed:4.0f}s  speed={sp:4.1f}  "
+                  f"next_cp={cp_idx}  steps={steps}  "
+                  f"stuck_streak={stuck_streak}  escapes={stuck_events}")
 
         elapsed_step = time.time() - step_start
-        sleep_for = interval - elapsed_step
+        sleep_for    = interval - elapsed_step
         if sleep_for > 0:
             time.sleep(sleep_for)
 
@@ -208,12 +293,21 @@ def main():
 
     if len(states) > 0:
         corr = np.corrcoef(states[:, 1], actions[:, 1])[0, 1]
-        print(f"heading_error -> steering correlation: {corr:.3f}  "
-              f"(human driving was ~-0.3; rule-based should be < -0.6)")
+        print(f"heading_error → steering correlation: {corr:.3f}  "
+              f"(target: < -0.5)")
+        steer_std = float(actions[:, 1].std())
+        thr_mean  = float(actions[:, 0].mean())
+        print(f"steering std: {steer_std:.3f}  throttle mean: {thr_mean:.3f}")
+        print(f"checkpoints reached: {len(cp_positions)}  escapes triggered: {stuck_events}")
 
     out = f"data_{args.tag}.npz"
     np.savez(out, states=states, actions=actions, seed=args.seed)
     print(f"Saved {out}")
+
+    cp_path = f"checkpoints_seed{args.seed}.json"
+    with open(cp_path, "w") as f:
+        json.dump({"seed": args.seed, "positions": cp_positions}, f, indent=2)
+    print(f"Saved {cp_path}")
 
     try:
         client.disconnect_ws()
