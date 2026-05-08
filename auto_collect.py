@@ -243,8 +243,16 @@ def main():
             time.sleep(interval)
             continue
 
-        sp = float(sensors.get("speed", 0.0))
-        if sp < STUCK_SPEED:
+        sp   = float(sensors.get("speed", 0.0))
+        rays = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
+
+        # Stuck detection requires BOTH low speed AND something physically
+        # blocking us — a forward-arc ray under 5 m. Without this, the bot
+        # falsely escapes whenever it slows down for an intentional reason
+        # (close-checkpoint brake mode, tight turn, etc.).
+        front_arc_min = float(min(rays[0], rays[1], rays[7]))
+        wall_in_front = front_arc_min < 5.0
+        if sp < STUCK_SPEED and wall_in_front:
             stuck_streak += 1
         else:
             stuck_streak = 0
@@ -264,8 +272,6 @@ def main():
                   f"({pos.get('x', 0):.1f}, {pos.get('z', 0):.1f}) "
                   f"t={time.time()-start:.1f}s")
         last_cp_idx = cp_idx
-
-        rays = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
 
         # Trigger escape if not already in one
         if escape_rev == 0 and escape_fwd == 0 and stuck_streak >= STUCK_FRAMES:
@@ -313,8 +319,9 @@ def main():
             else:
                 mode = "drive  "
             dist = sensors.get("navigation", {}).get("distance", -1.0)
+            wall = "WALL" if wall_in_front else "open"
             print(f"  t={elapsed:4.0f}s  spd={sp:4.1f}  cp={cp_idx}  d={dist:5.1f}m  "
-                  f"steps={steps}  esc={stuck_events}  "
+                  f"steps={steps}  esc={stuck_events}  front={front_arc_min:4.1f}m({wall})  "
                   f"mode={mode}  thr={throttle:+.2f} str={steer:+.2f}")
 
         elapsed_step = time.time() - step_start
