@@ -113,8 +113,17 @@ def rule_drive(sensors: dict, post_escape_dir: float = 0.0,
     if abs(steer) > 0.75 and distance > 8.0:
         throttle = min(throttle, 0.7)
 
-    if friction < 0.4:
-        throttle *= 0.7
+    # Low-friction (ice / mud) compensation. On low friction, hard inputs
+    # cause spinouts and skidding instead of acceleration / turning. Soften
+    # both throttle AND steering proportionally so the bot drives smoothly:
+    #   friction = 1.0  → no change
+    #   friction = 0.5  → inputs scaled to 0.9
+    #   friction = 0.3  → inputs scaled to 0.7
+    #   friction = 0.1  → inputs scaled to 0.5 (very gentle)
+    if friction < 0.6:
+        soft     = max(0.5, 0.4 + friction)
+        throttle = throttle * soft
+        steer    = steer    * soft
 
     return float(throttle), float(steer)
 
@@ -279,6 +288,8 @@ def main():
             stuck_events += 1
             stuck_streak = 0
 
+        in_escape = (escape_rev > 0) or (escape_fwd > 0)
+
         if escape_rev > 0:
             throttle, steer = escape_reverse(rays)
             escape_rev -= 1
@@ -298,6 +309,17 @@ def main():
                                          post_escape_frames=post_escape_frames)
             if post_escape_frames > 0:
                 post_escape_frames -= 1
+
+        # Low-friction softening on escape commands too (rule_drive already
+        # handles its own case internally). Hard reverse + full lock on ice
+        # spins the bot uselessly — proportional softening keeps it under
+        # control.
+        if in_escape:
+            friction = float(sensors.get("ground", {}).get("friction", 1.0))
+            if friction < 0.6:
+                soft     = max(0.5, 0.4 + friction)
+                throttle = throttle * soft
+                steer    = steer    * soft
 
         try:
             client.send_control_ws(throttle, steer)
