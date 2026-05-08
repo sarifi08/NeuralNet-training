@@ -39,17 +39,29 @@ HZ = 20.0
 #   3: rear-left   4: rear        5: rear-right
 #   6: right (-90°)  7: front-right (-45°)
 
-STUCK_SPEED       = 0.4
-STUCK_FRAMES      = 30      # ~1.5 s before triggering escape
-ESCAPE_REV_FRAMES = 30      # ~1.5 s of reverse + hard turn
-ESCAPE_FWD_FRAMES = 20      # ~1.0 s of forward push afterwards
+STUCK_SPEED         = 0.4
+STUCK_FRAMES        = 30      # ~1.5 s before triggering escape
+ESCAPE_REV_FRAMES   = 30      # ~1.5 s of reverse + hard turn
+ESCAPE_FWD_FRAMES   = 20      # ~1.0 s of forward push afterwards
+POST_ESCAPE_FRAMES  = 60      # ~3.0 s of detour bias after each escape
+
+# Approach scaling — the closer the checkpoint, the tighter we steer.
+def steer_scale(distance: float) -> float:
+    if distance < 6.0:
+        return 0.45
+    if distance < 12.0:
+        return 0.75
+    return 1.2
 
 
-def rule_drive(sensors: dict) -> tuple[float, float]:
-    """Smooth heading-pursuit with decisive single-sided front-block override."""
-    nav  = sensors.get("navigation", {})
-    he   = float(nav.get("heading_error", 0.0))                        # +left, -right
-    rays = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
+def rule_drive(sensors: dict, post_escape_dir: float = 0.0,
+               post_escape_frames: int = 0) -> tuple[float, float]:
+    """Smooth heading-pursuit with decisive front-block override and
+    distance-aware aggressiveness."""
+    nav      = sensors.get("navigation", {})
+    he       = float(nav.get("heading_error", 0.0))                # +left, -right
+    distance = float(nav.get("distance", 50.0))
+    rays     = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
     friction = sensors.get("ground", {}).get("friction", 1.0)
 
     front       = float(rays[0])
@@ -58,27 +70,37 @@ def rule_drive(sensors: dict) -> tuple[float, float]:
     front_right = float(rays[7])   # -45°
     right       = float(rays[6])   # -90°
 
-    # Primary: smooth heading pursuit (continuous, no snapping)
-    # /1.2 instead of /π so heading_error of ~1 rad gives a noticeable steer.
-    steer = -he / 1.2
+    # Primary: smooth heading pursuit, scaled by distance so the bot turns
+    # MUCH harder when close to the checkpoint (was too gentle before — it
+    # would graze past at 4-5 m without ever fully aligning).
+    steer = -he / steer_scale(distance)
 
-    # Override only when the front itself is blocked. Pick ONE side — the
-    # more-open one — and apply a unilateral correction. No bilateral push.
+    # Post-escape bias: after each escape, push toward the side we just
+    # escaped to, decaying linearly. Prevents the bot from immediately
+    # swinging back into the wall it just left.
+    if post_escape_frames > 0:
+        decay = post_escape_frames / POST_ESCAPE_FRAMES
+        steer += post_escape_dir * 0.55 * decay
+
+    # Front-blocked override — pick ONE side, the more open one
     if front < 7.0:
         left_score  = front_left  + 0.4 * left
         right_score = front_right + 0.4 * right
         if left_score > right_score + 1.0:
-            steer -= 0.85          # turn left
+            steer -= 0.85
         elif right_score > left_score + 1.0:
-            steer += 0.85          # turn right
+            steer += 0.85
         else:
-            # Tie: bias toward whichever side heading_error already prefers
             steer += -0.85 if he > 0 else 0.85
 
     steer = float(np.clip(steer, -1.0, 1.0))
 
-    # Throttle — keep it high so the bot has authority to move
-    if front < 3.5:
+    # Throttle — be aggressive in clear paths, but BRAKE when close to a
+    # checkpoint and badly off-heading (otherwise we orbit at high speed
+    # and can never turn tight enough to actually hit it).
+    if distance < 10.0 and abs(he) > 1.0:
+        throttle = 0.25                       # slow → tighter turn radius
+    elif front < 3.5:
         throttle = 0.45
     elif front < 7.0:
         throttle = 0.75
@@ -87,8 +109,8 @@ def rule_drive(sensors: dict) -> tuple[float, float]:
     else:
         throttle = 1.0
 
-    # Slight ease in tight turns so the bot doesn't understeer into a wall
-    if abs(steer) > 0.75:
+    # Slight ease in very tight turns
+    if abs(steer) > 0.75 and distance > 8.0:
         throttle = min(throttle, 0.7)
 
     if friction < 0.4:
@@ -115,21 +137,26 @@ def escape_reverse(rays: np.ndarray) -> tuple[float, float]:
     return -0.8, steer
 
 
-def escape_forward(rays: np.ndarray) -> tuple[float, float]:
-    """After reversing, drive forward toward the most-open forward direction."""
+def escape_forward(rays: np.ndarray) -> tuple[float, float, float]:
+    """After reversing, drive forward toward the most-open forward direction.
+
+    Returns (throttle, steer, chosen_dir) where chosen_dir is -1 (left),
+    +1 (right) or 0 — used to bias normal driving for a few seconds afterwards
+    so the bot doesn't swing straight back into the wall it just escaped from.
+    """
     rays = np.asarray(rays, dtype=float)
     front       = float(rays[0])
     front_left  = float(rays[1])
     front_right = float(rays[7])
 
     if front_left > front_right + 1.0:
-        steer = -0.6
+        steer, chosen_dir = -0.6, -1.0
     elif front_right > front_left + 1.0:
-        steer = +0.6
+        steer, chosen_dir = +0.6, +1.0
     else:
-        steer = 0.0
+        steer, chosen_dir = 0.0, 0.0
     throttle = 0.85 if front > 4.0 else 0.6
-    return throttle, steer
+    return throttle, steer, chosen_dir
 
 
 def main():
@@ -191,13 +218,15 @@ def main():
 
     threading.Thread(target=poll, daemon=True).start()
 
-    interval     = 1.0 / HZ
-    start        = time.time()
-    steps        = 0
-    stuck_streak = 0
-    escape_rev   = 0          # frames remaining of reverse phase
-    escape_fwd   = 0          # frames remaining of forward phase
-    stuck_events = 0
+    interval           = 1.0 / HZ
+    start              = time.time()
+    steps              = 0
+    stuck_streak       = 0
+    escape_rev         = 0     # frames remaining of reverse phase
+    escape_fwd         = 0     # frames remaining of forward phase
+    stuck_events       = 0
+    post_escape_frames = 0     # frames remaining of post-escape detour bias
+    post_escape_dir    = 0.0   # +1 / -1 / 0 — direction the last escape committed to
 
     cp_positions: dict[int, dict] = {}
     last_cp_idx: int | None       = None
@@ -248,10 +277,19 @@ def main():
             if escape_rev == 0:
                 escape_fwd = ESCAPE_FWD_FRAMES
         elif escape_fwd > 0:
-            throttle, steer = escape_forward(rays)
+            throttle, steer, chosen_dir = escape_forward(rays)
             escape_fwd -= 1
+            if escape_fwd == 0:
+                # Hand-off to normal driving with a fading detour bias toward
+                # the side this escape committed to.
+                post_escape_dir    = chosen_dir
+                post_escape_frames = POST_ESCAPE_FRAMES
         else:
-            throttle, steer = rule_drive(sensors)
+            throttle, steer = rule_drive(sensors,
+                                         post_escape_dir=post_escape_dir,
+                                         post_escape_frames=post_escape_frames)
+            if post_escape_frames > 0:
+                post_escape_frames -= 1
 
         try:
             client.send_control_ws(throttle, steer)
@@ -264,10 +302,17 @@ def main():
         steps += 1
         if steps % 200 == 0:
             elapsed = time.time() - start
-            mode = "ESC-REV" if escape_rev else ("ESC-FWD" if escape_fwd else "drive  ")
-            print(f"  t={elapsed:4.0f}s  speed={sp:4.1f}  "
-                  f"next_cp={cp_idx}  steps={steps}  "
-                  f"stuck={stuck_streak:3d}  escapes={stuck_events}  "
+            if escape_rev:
+                mode = "ESC-REV"
+            elif escape_fwd:
+                mode = "ESC-FWD"
+            elif post_escape_frames > 0:
+                mode = f"BIAS{int(post_escape_dir):+d}"
+            else:
+                mode = "drive  "
+            dist = sensors.get("navigation", {}).get("distance", -1.0)
+            print(f"  t={elapsed:4.0f}s  spd={sp:4.1f}  cp={cp_idx}  d={dist:5.1f}m  "
+                  f"steps={steps}  esc={stuck_events}  "
                   f"mode={mode}  thr={throttle:+.2f} str={steer:+.2f}")
 
         elapsed_step = time.time() - step_start
