@@ -45,6 +45,13 @@ ESCAPE_REV_FRAMES   = 30      # ~1.5 s of reverse + hard turn
 ESCAPE_FWD_FRAMES   = 20      # ~1.0 s of forward push afterwards
 POST_ESCAPE_FRAMES  = 60      # ~3.0 s of detour bias after each escape
 
+# When the bot has been stuck multiple times without making progress
+# toward the checkpoint, escalate to a long perpendicular detour that
+# IGNORES heading_error — the only way to break out of trap geometries.
+FRUSTRATION_THRESHOLD = 2     # consecutive failed escapes before detour
+DETOUR_FRAMES         = 140   # ~7 s of committed sideways drive
+PROGRESS_DELTA        = 4.0   # m of distance change to count as 'progress'
+
 # Approach scaling — the closer the checkpoint, the tighter we steer.
 def steer_scale(distance: float) -> float:
     if distance < 6.0:
@@ -135,6 +142,35 @@ def escape_reverse(rays: np.ndarray) -> tuple[float, float]:
     else:
         steer = -1.0       # swing front to RIGHT
     return -0.8, steer
+
+
+def detour_drive(rays: np.ndarray, detour_dir: float) -> tuple[float, float]:
+    """Frustration mode: commit to a sideways direction, IGNORE the
+    checkpoint, just find a way around the obstacle.
+
+    detour_dir: -1 = drive left, +1 = drive right.
+    Steers ~60° off-axis and modulates throttle by front clearance.
+    """
+    rays  = np.asarray(rays, dtype=float)
+    front = float(rays[0])
+
+    # Pick whichever side ray is most open for fine-tuning
+    if detour_dir < 0:
+        # Going left — prefer the more open of front-left vs left
+        side_clear = max(float(rays[1]), float(rays[2]))
+    else:
+        side_clear = max(float(rays[6]), float(rays[7]))
+
+    # Hard sideways steer, eased slightly when there's lots of room
+    steer = detour_dir * (0.85 if side_clear < 15 else 0.6)
+
+    if front < 4.0:
+        throttle = 0.4
+    elif front < 8.0:
+        throttle = 0.6
+    else:
+        throttle = 0.8
+    return float(throttle), float(steer)
 
 
 def escape_forward(rays: np.ndarray) -> tuple[float, float, float]:
@@ -228,6 +264,14 @@ def main():
     post_escape_frames = 0     # frames remaining of post-escape detour bias
     post_escape_dir    = 0.0   # +1 / -1 / 0 — direction the last escape committed to
 
+    # Frustration tracking — escalate to long perpendicular detour when
+    # repeated escapes fail to make checkpoint progress.
+    failed_escapes        = 0       # consecutive escapes without progress
+    distance_at_escape    = None    # checkpoint distance at last escape trigger
+    detour_frames         = 0       # frames remaining of frustration detour
+    detour_dir            = 0.0     # -1 = drive left, +1 = drive right
+    detours_triggered     = 0
+
     cp_positions: dict[int, dict] = {}
     last_cp_idx: int | None       = None
 
@@ -247,10 +291,11 @@ def main():
         else:
             stuck_streak = 0
 
-        # Checkpoint position logging
-        nav    = sensors.get("navigation", {})
-        cp_idx = nav.get("checkpoint_index", 0)
-        pos    = sensors.get("position", {}) or {}
+        # Checkpoint position logging — also resets frustration state
+        nav      = sensors.get("navigation", {})
+        cp_idx   = nav.get("checkpoint_index", 0)
+        distance = float(nav.get("distance", 50.0))
+        pos      = sensors.get("position", {}) or {}
         if last_cp_idx is not None and cp_idx != last_cp_idx:
             cp_positions[int(cp_idx)] = {
                 "x": float(pos.get("x", 0.0)),
@@ -261,17 +306,54 @@ def main():
             print(f"  ★ next_cp now {cp_idx} — bot at "
                   f"({pos.get('x', 0):.1f}, {pos.get('z', 0):.1f}) "
                   f"t={time.time()-start:.1f}s")
+            # Made progress — clear frustration
+            failed_escapes     = 0
+            distance_at_escape = None
         last_cp_idx = cp_idx
 
         rays = np.asarray(sensors.get("rays", [50.0] * 8), dtype=float)
 
-        # Trigger escape if not already in one
-        if escape_rev == 0 and escape_fwd == 0 and stuck_streak >= STUCK_FRAMES:
-            escape_rev = ESCAPE_REV_FRAMES
-            stuck_events += 1
-            stuck_streak = 0
+        # Trigger escape if not in one and not currently detouring
+        triggering_escape = (
+            escape_rev == 0
+            and escape_fwd == 0
+            and detour_frames == 0
+            and stuck_streak >= STUCK_FRAMES
+        )
+        if triggering_escape:
+            # Track whether the LAST escape made checkpoint progress
+            if distance_at_escape is not None:
+                if abs(distance - distance_at_escape) < PROGRESS_DELTA:
+                    failed_escapes += 1
+                else:
+                    failed_escapes = 0
+            distance_at_escape = distance
 
-        if escape_rev > 0:
+            # Frustrated → long perpendicular detour, ignoring heading_error
+            if failed_escapes >= FRUSTRATION_THRESHOLD:
+                # Pick the more-open side at +90° / -90° (lateral rays)
+                if float(rays[2]) > float(rays[6]):
+                    detour_dir = -1.0           # drive LEFT
+                else:
+                    detour_dir = +1.0           # drive RIGHT
+                detour_frames     = DETOUR_FRAMES
+                detours_triggered += 1
+                failed_escapes    = 0
+                stuck_streak      = 0
+                print(f"  ⚠ FRUSTRATION DETOUR ({'LEFT' if detour_dir<0 else 'RIGHT'}) "
+                      f"at d={distance:.1f}m  t={time.time()-start:.1f}s")
+            else:
+                escape_rev   = ESCAPE_REV_FRAMES
+                stuck_events += 1
+                stuck_streak = 0
+
+        # Drive priority: detour > escape_rev > escape_fwd > normal+bias
+        if detour_frames > 0:
+            throttle, steer = detour_drive(rays, detour_dir)
+            detour_frames  -= 1
+            # Detour also breaks any pending escape state
+            escape_rev = escape_fwd = 0
+        elif escape_rev > 0:
             throttle, steer = escape_reverse(rays)
             escape_rev -= 1
             if escape_rev == 0:
@@ -280,8 +362,6 @@ def main():
             throttle, steer, chosen_dir = escape_forward(rays)
             escape_fwd -= 1
             if escape_fwd == 0:
-                # Hand-off to normal driving with a fading detour bias toward
-                # the side this escape committed to.
                 post_escape_dir    = chosen_dir
                 post_escape_frames = POST_ESCAPE_FRAMES
         else:
@@ -302,7 +382,9 @@ def main():
         steps += 1
         if steps % 200 == 0:
             elapsed = time.time() - start
-            if escape_rev:
+            if detour_frames > 0:
+                mode = f"DTR{'L' if detour_dir<0 else 'R'}"
+            elif escape_rev:
                 mode = "ESC-REV"
             elif escape_fwd:
                 mode = "ESC-FWD"
@@ -310,9 +392,8 @@ def main():
                 mode = f"BIAS{int(post_escape_dir):+d}"
             else:
                 mode = "drive  "
-            dist = sensors.get("navigation", {}).get("distance", -1.0)
-            print(f"  t={elapsed:4.0f}s  spd={sp:4.1f}  cp={cp_idx}  d={dist:5.1f}m  "
-                  f"steps={steps}  esc={stuck_events}  "
+            print(f"  t={elapsed:4.0f}s  spd={sp:4.1f}  cp={cp_idx}  d={distance:5.1f}m  "
+                  f"steps={steps}  esc={stuck_events}  dtr={detours_triggered}  "
                   f"mode={mode}  thr={throttle:+.2f} str={steer:+.2f}")
 
         elapsed_step = time.time() - step_start
