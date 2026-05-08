@@ -342,9 +342,10 @@ def main():
                 mode = "drive  "
             dist = sensors.get("navigation", {}).get("distance", -1.0)
             wall = "WALL" if wall_in_front else "open"
+            fric = float(sensors.get("ground", {}).get("friction", 1.0))
             print(f"  t={elapsed:4.0f}s  spd={sp:4.1f}  cp={cp_idx}  d={dist:5.1f}m  "
-                  f"steps={steps}  esc={stuck_events}  front={front_arc_min:4.1f}m({wall})  "
-                  f"mode={mode}  thr={throttle:+.2f} str={steer:+.2f}")
+                  f"esc={stuck_events}  front={front_arc_min:4.1f}m({wall})  "
+                  f"f={fric:.2f}  mode={mode}  thr={throttle:+.2f} str={steer:+.2f}")
 
         elapsed_step = time.time() - step_start
         sleep_for    = interval - elapsed_step
