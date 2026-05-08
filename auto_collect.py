@@ -231,7 +231,9 @@ def main():
     cp_positions: dict[int, dict] = {}
     last_cp_idx: int | None       = None
 
-    while time.time() - start < duration:
+    interrupted = False
+    try:
+      while time.time() - start < duration:
         step_start = time.time()
 
         with sensor_lock:
@@ -319,9 +321,15 @@ def main():
         sleep_for    = interval - elapsed_step
         if sleep_for > 0:
             time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"\n  [Ctrl+C] interrupted at t={time.time()-start:.1f}s — "
+              f"saving partial data anyway")
 
     stop_flag[0] = True
     print("\nStopping recording…")
+    if interrupted:
+        print("  (recording was cut short; downloaded data is what made it to the server)")
     info = client.stop_recording()
     print(f"Samples on server: {info.get('sample_count', '?')}")
 
