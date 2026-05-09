@@ -118,12 +118,18 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
         if last_cp_idx is None:
             last_cp_idx = cp_idx
         elif cp_idx != last_cp_idx:
-            checkpoints_passed += (cp_idx - last_cp_idx) % 8
+            checkpoints_passed += (cp_idx - last_cp_idx) % TARGET_CHECKPOINTS
             last_cp_idx = cp_idx
 
-        # Stuck heuristic
+        # Stuck heuristic — REQUIRES a wall in front, not just low speed.
+        # Without this check, mud / ice / sand (where speed naturally drops
+        # to 0.1-0.3 even when accelerating forward) triggers spurious
+        # reverses, sabotaging the trained network's correct mud behaviour.
         sp = sensors["speed"]
-        if sp < 0.3:
+        rays = sensors.get("rays", [50.0] * 8)
+        front_arc_min = float(min(rays[0], rays[1], rays[7]))
+        wall_in_front = front_arc_min < 5.0
+        if sp < 0.3 and wall_in_front:
             stuck_streak += 1
         else:
             max_stuck = max(max_stuck, stuck_streak)
