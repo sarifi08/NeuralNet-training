@@ -31,7 +31,7 @@ from drive2win.normalize import sensors_to_input, clip_action
 from drive2win.smooth import make_smooth_policy
 
 SERVER_URL = "https://ml.ferit.tech"
-TARGET_CHECKPOINTS = 8
+TARGET_CHECKPOINTS = 12
 BROWSER_LOAD_TIMEOUT = 20   # seconds to wait for browser to load & send first sensor reading
 
 
