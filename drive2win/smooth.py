@@ -29,16 +29,23 @@ def make_smooth_policy(policy_fn, alpha: float = 0.7):
     Returns:
         Wrapped callable with the same signature as policy_fn.
         State resets automatically between sessions via reset().
+        The wrapper also exposes `policy.last_raw` (np.ndarray shape (2,))
+        holding the underlying policy's pre-smoothing output from the most
+        recent call. Diagnostic code reads this to compare network vs.
+        commanded actions without paying for a second forward pass.
     """
     if not 0.0 < alpha <= 1.0:
         raise ValueError(f"alpha must be in (0, 1], got {alpha}")
 
     prev = np.zeros(2, dtype=np.float64)
+    last_raw = np.zeros(2, dtype=np.float64)
 
     def policy(state):
         nonlocal prev
         raw = policy_fn(state)
         t, s = float(raw[0]), float(raw[1])
+        last_raw[0] = t
+        last_raw[1] = s
         smoothed = alpha * np.array([t, s]) + (1.0 - alpha) * prev
         prev[:] = smoothed
         return float(smoothed[0]), float(smoothed[1])
@@ -46,6 +53,8 @@ def make_smooth_policy(policy_fn, alpha: float = 0.7):
     def reset():
         nonlocal prev
         prev = np.zeros(2, dtype=np.float64)
+        last_raw[:] = 0.0
 
     policy.reset = reset
+    policy.last_raw = last_raw
     return policy

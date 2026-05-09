@@ -21,6 +21,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from typing import IO
 
 import numpy as np
 
@@ -51,13 +52,24 @@ def flatten_sensors(raw: dict) -> dict:
     }
 
 
-def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0) -> dict:
+def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
+                    frame_log_path: str | None = None,
+                    print_status: bool = True) -> dict:
     """REST-polling control loop with background sensor thread.
 
     A background thread continuously polls GET /sensors as fast as the network
     allows (~4 Hz over a transatlantic link). The main control loop runs at the
     target Hz using the most recently fetched sensor reading, decoupling control
     frequency from REST latency.
+
+    If frame_log_path is provided, every control frame is appended as a JSON
+    line capturing sensors, the network's RAW output (before smoothing/boost/
+    escape override), the final commanded output, escape state, and an `event`
+    field on checkpoint passes / escape triggers / crashes. This is the
+    primary diagnostic tool for "what is the bot actually doing?".
+
+    print_status=True prints a 1-second live status line plus inline events
+    so you can interpret runs without opening the JSONL.
     """
     # ── Background sensor polling thread ─────────────────────────────────
     sensor_lock = threading.Lock()
@@ -95,6 +107,7 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
     checkpoints_passed = 0
     last_cp_idx: int | None = None
     crashes = 0
+    last_crashes = 0
     last_pos = None
     stuck_streak = 0
     max_stuck = 0
@@ -106,138 +119,211 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
     escapes_triggered  = 0
     track = []
     next_log = start
+    next_status = start
 
-    while time.time() - start < duration:
-        step_start = time.time()
+    log_fp: IO | None = None
+    if frame_log_path:
+        Path(frame_log_path).parent.mkdir(parents=True, exist_ok=True)
+        log_fp = open(frame_log_path, "w")
 
-        with sensor_lock:
-            sensors = latest[0]
+    try:
+        while time.time() - start < duration:
+            step_start = time.time()
 
-        if sensors is None:
-            time.sleep(interval)
-            continue
+            with sensor_lock:
+                sensors = latest[0]
 
-        state = {"sensors": sensors, "position": sensors["position"]}
+            if sensors is None:
+                time.sleep(interval)
+                continue
 
-        # Checkpoint tracking via checkpoint_index increments
-        nav = sensors["navigation"]
-        cp_idx = nav.get("checkpoint_index", 0)
-        if last_cp_idx is None:
-            last_cp_idx = cp_idx
-        elif cp_idx != last_cp_idx:
-            checkpoints_passed += (cp_idx - last_cp_idx) % TARGET_CHECKPOINTS
-            last_cp_idx = cp_idx
+            state = {"sensors": sensors, "position": sensors["position"]}
 
-        # Stuck heuristic — REQUIRES a wall in front, not just low speed.
-        # Without this check, mud / ice / sand (where speed naturally drops
-        # to 0.1-0.3 even when accelerating forward) triggers spurious
-        # reverses, sabotaging the trained network's correct mud behaviour.
-        sp = sensors["speed"]
-        rays = sensors.get("rays", [50.0] * 8)
-        front_arc_min = float(min(rays[0], rays[1], rays[7]))
-        wall_in_front = front_arc_min < 5.0
-        if sp < 0.3 and wall_in_front:
-            stuck_streak += 1
-        else:
-            max_stuck = max(max_stuck, stuck_streak)
-            stuck_streak = 0
+            # Checkpoint tracking via checkpoint_index increments
+            nav = sensors["navigation"]
+            cp_idx = nav.get("checkpoint_index", 0)
+            cp_event_dist = None
+            if last_cp_idx is None:
+                last_cp_idx = cp_idx
+            elif cp_idx != last_cp_idx:
+                delta = (cp_idx - last_cp_idx) % TARGET_CHECKPOINTS
+                checkpoints_passed += delta
+                cp_event_dist = float(nav.get("distance", -1.0))
+                if print_status:
+                    print(f"  [CP HIT cp={checkpoints_passed} t={time.time()-start:5.1f}s "
+                          f"d_at_hit={cp_event_dist:.1f}m]")
+                last_cp_idx = cp_idx
 
-        # Crash detection — position teleport > 5 m
-        pos = sensors["position"]
-        if last_pos is not None and pos:
-            dx = pos.get("x", 0) - last_pos.get("x", 0)
-            dz = pos.get("z", 0) - last_pos.get("z", 0)
-            if (dx * dx + dz * dz) > 25.0:
-                crashes += 1
-        last_pos = pos
+            # Stuck heuristic — REQUIRES a wall in front, not just low speed.
+            # Without this check, mud / ice / sand (where speed naturally drops
+            # to 0.1-0.3 even when accelerating forward) triggers spurious
+            # reverses, sabotaging the trained network's correct mud behaviour.
+            sp = sensors["speed"]
+            rays = sensors.get("rays", [50.0] * 8)
+            front_arc_min = float(min(rays[0], rays[1], rays[7]))
+            wall_in_front = front_arc_min < 5.0
+            if sp < 0.3 and wall_in_front:
+                stuck_streak += 1
+            else:
+                max_stuck = max(max_stuck, stuck_streak)
+                stuck_streak = 0
 
-        # Trigger a 3-point-turn escape if we're stuck against a wall and not
-        # already inside one.
-        if (escape_rev == 0 and escape_fwd == 0
-                and stuck_streak >= STUCK_THRESHOLD):
-            # Pick rotation direction by which forward arc has more clearance.
-            # left_score uses rays at +45/+90/+135; right uses -45/-90/-135.
-            # Whichever side is more open is the side we want the bot to face
-            # AFTER rotating.
-            try:
-                rs = list(rays)
-                left_score  = float(rs[1] + rs[2] + rs[3])
-                right_score = float(rs[5] + rs[6] + rs[7])
-            except Exception:
-                left_score = right_score = 1.0
-            escape_dir = -1.0 if left_score > right_score else +1.0
-            escape_rev = ESCAPE_REV_FRAMES
-            escapes_triggered += 1
-            stuck_streak = 0
-            if hasattr(policy_fn, "reset"):
-                policy_fn.reset()
+            # Crash detection — position teleport > 5 m
+            pos = sensors["position"]
+            if last_pos is not None and pos:
+                dx = pos.get("x", 0) - last_pos.get("x", 0)
+                dz = pos.get("z", 0) - last_pos.get("z", 0)
+                if (dx * dx + dz * dz) > 25.0:
+                    crashes += 1
+            last_pos = pos
+            crash_event = crashes > last_crashes
+            if crash_event and print_status:
+                print(f"  [CRASH t={time.time()-start:5.1f}s total={crashes}]")
+            last_crashes = crashes
 
-        if escape_rev > 0:
-            # Reverse + hard turn. Ackermann under reverse: steer = -escape_dir
-            # makes the FRONT swing toward escape_dir (i.e. rotates the bot
-            # toward the more-open side).
-            throttle = -0.7
-            steering = -float(escape_dir)
-            escape_rev -= 1
-            if escape_rev == 0:
-                escape_fwd = ESCAPE_FWD_FRAMES
-        elif escape_fwd > 0:
-            # Forward + continuing turn — completes the rotation in same
-            # direction so the bot ends up genuinely facing a new heading
-            # instead of right back at the wall it came from.
-            throttle = 0.7
-            steering = 0.7 * float(escape_dir)
-            escape_fwd -= 1
-            if escape_fwd == 0:
-                # Hand off to the network with a 3-second decaying detour
-                # bias so heading-pursuit doesn't immediately swing the bot
-                # back into the wall it just left.
-                post_escape_dir    = float(escape_dir)
-                post_escape_frames = POST_ESCAPE_FRAMES
+            # Trigger a 3-point-turn escape if we're stuck against a wall and not
+            # already inside one.
+            escape_event_meta = None
+            if (escape_rev == 0 and escape_fwd == 0
+                    and stuck_streak >= STUCK_THRESHOLD):
+                try:
+                    rs = list(rays)
+                    left_score  = float(rs[1] + rs[2] + rs[3])
+                    right_score = float(rs[5] + rs[6] + rs[7])
+                except Exception:
+                    left_score = right_score = 1.0
+                escape_dir = -1.0 if left_score > right_score else +1.0
+                escape_rev = ESCAPE_REV_FRAMES
+                escapes_triggered += 1
+                stuck_streak = 0
+                escape_event_meta = (left_score, right_score, sp, front_arc_min)
+                if print_status:
+                    print(f"  [ESCAPE TRIGGER t={time.time()-start:5.1f}s "
+                          f"dir={int(escape_dir):+d} L={left_score:.1f} R={right_score:.1f} "
+                          f"sp={sp:.2f} front={front_arc_min:.1f}m]")
                 if hasattr(policy_fn, "reset"):
                     policy_fn.reset()
-        else:
-            throttle, steering = policy_fn(state)
 
-            # Distance-aware steering boost. The network was trained on data
-            # where heading_error → steering correlation is -0.6, but its
-            # outputs get gentler as it approaches the checkpoint. Boost
-            # when close so we actually hit the cp instead of grazing past.
-            distance = float(nav.get("distance", 50.0))
-            if distance < 8.0:
-                steering = max(-1.0, min(1.0, steering * 1.5))
-            elif distance < 14.0:
-                steering = max(-1.0, min(1.0, steering * 1.2))
+            # Decide control. nn_t/nn_s capture the network's pre-override
+            # output (None during escape, since the network isn't queried).
+            nn_t: float | None = None
+            nn_s: float | None = None
+            phase = "drive"
+            if escape_rev > 0:
+                throttle = -0.7
+                steering = -float(escape_dir)
+                escape_rev -= 1
+                phase = "esc_rev"
+                if escape_rev == 0:
+                    escape_fwd = ESCAPE_FWD_FRAMES
+            elif escape_fwd > 0:
+                throttle = 0.7
+                steering = 0.7 * float(escape_dir)
+                escape_fwd -= 1
+                phase = "esc_fwd"
+                if escape_fwd == 0:
+                    post_escape_dir    = float(escape_dir)
+                    post_escape_frames = POST_ESCAPE_FRAMES
+                    if hasattr(policy_fn, "reset"):
+                        policy_fn.reset()
+            else:
+                throttle, steering = policy_fn(state)
+                # Capture raw NN output BEFORE distance boost / post-escape bias.
+                # smooth.py exposes last_raw on the smoothed wrapper.
+                if hasattr(policy_fn, "last_raw"):
+                    nn_t = float(policy_fn.last_raw[0])
+                    nn_s = float(policy_fn.last_raw[1])
+                else:
+                    nn_t, nn_s = float(throttle), float(steering)
 
-            # Post-escape bias: push toward the side the escape committed to
-            # so the bot doesn't immediately swing back into the wall.
-            if post_escape_frames > 0:
-                decay = post_escape_frames / POST_ESCAPE_FRAMES
-                steering = max(-1.0, min(1.0,
-                                          steering + post_escape_dir * 0.45 * decay))
-                post_escape_frames -= 1
+                distance = float(nav.get("distance", 50.0))
+                if distance < 8.0:
+                    steering = max(-1.0, min(1.0, steering * 1.5))
+                    phase = "drive_boost1.5"
+                elif distance < 14.0:
+                    steering = max(-1.0, min(1.0, steering * 1.2))
+                    phase = "drive_boost1.2"
 
-            last_policy_steering = steering
+                if post_escape_frames > 0:
+                    decay = post_escape_frames / POST_ESCAPE_FRAMES
+                    steering = max(-1.0, min(1.0,
+                                              steering + post_escape_dir * 0.45 * decay))
+                    post_escape_frames -= 1
+                    phase = phase + "+postesc"
 
-        try:
-            client.send_control_ws(throttle, steering)
-        except Exception:
             try:
-                client.send_control(throttle, steering)
+                client.send_control_ws(throttle, steering)
             except Exception:
-                pass
+                try:
+                    client.send_control(throttle, steering)
+                except Exception:
+                    pass
 
-        steps += 1
+            steps += 1
+            now = time.time()
+            t_rel = now - start
 
-        now = time.time()
-        if now >= next_log:
-            track.append({"t": now - start, "position": pos, "speed": sp})
-            next_log = now + 1.0
+            # 1 Hz position track sample (kept for benchmark JSON compatibility)
+            if now >= next_log:
+                track.append({"t": t_rel, "position": pos, "speed": sp})
+                next_log = now + 1.0
 
-        elapsed_step = time.time() - step_start
-        sleep_for = interval - elapsed_step
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+            # 1 Hz live status print
+            if print_status and now >= next_status:
+                nn_str = (f"({nn_t:+.2f},{nn_s:+.2f})"
+                          if nn_t is not None else "(esc, esc)")
+                he = float(nav.get("heading_error", 0.0))
+                d  = float(nav.get("distance", -1.0))
+                fr = float(sensors.get("ground_friction", 1.0))
+                rays_F = f"[{rays[0]:.1f} {rays[1]:.1f} {rays[7]:.1f}]"
+                esc_marker = "-" if phase == "drive" else phase
+                print(f"  [t={t_rel:5.1f}s cp={checkpoints_passed}/{TARGET_CHECKPOINTS} "
+                      f"nn={nn_str} cmd=({throttle:+.2f},{steering:+.2f}) "
+                      f"sp={sp:.1f} he={he:+.2f} d={d:5.1f} fr={fr:.2f} "
+                      f"F={rays_F} esc={esc_marker} stuck={stuck_streak}]")
+                next_status = now + 1.0
+
+            # Per-frame JSONL log (only when --log-frames was passed)
+            if log_fp is not None:
+                event = None
+                if cp_event_dist is not None:
+                    event = f"cp_hit:{checkpoints_passed}@{cp_event_dist:.2f}m"
+                elif escape_event_meta is not None:
+                    L, R, esc_sp, esc_front = escape_event_meta
+                    event = f"escape:dir={int(escape_dir):+d}:L={L:.1f}:R={R:.1f}:front={esc_front:.1f}"
+                elif crash_event:
+                    event = f"crash:total={crashes}"
+                row = {
+                    "t":      round(t_rel, 3),
+                    "step":   steps,
+                    "sp":     round(float(sp), 3),
+                    "he":     round(float(nav.get("heading_error", 0.0)), 4),
+                    "d":      round(float(nav.get("distance", -1.0)), 3),
+                    "fr":     round(float(sensors.get("ground_friction", 1.0)), 3),
+                    "rays":   [round(float(r), 2) for r in rays],
+                    "cp":     int(cp_idx),
+                    "cp_passed": int(checkpoints_passed),
+                    "nn_t":   None if nn_t is None else round(nn_t, 4),
+                    "nn_s":   None if nn_s is None else round(nn_s, 4),
+                    "cmd_t":  round(float(throttle), 4),
+                    "cmd_s":  round(float(steering), 4),
+                    "phase":  phase,
+                    "stuck":  int(stuck_streak),
+                    "esc_rev": int(escape_rev),
+                    "esc_fwd": int(escape_fwd),
+                    "post_esc": int(post_escape_frames),
+                }
+                if event is not None:
+                    row["event"] = event
+                log_fp.write(json.dumps(row) + "\n")
+
+            elapsed_step = time.time() - step_start
+            sleep_for = interval - elapsed_step
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    finally:
+        if log_fp is not None:
+            log_fp.close()
 
     stop_flag[0] = True
     elapsed = time.time() - start
@@ -269,7 +355,8 @@ def make_module_policy(module_path: str, weights_path: str, alpha: float = 0.7):
 
 
 def run_one(policy, seed: int, run_idx: int, total_runs: int,
-            duration: float, player_name: str) -> dict:
+            duration: float, player_name: str,
+            frame_log_path: str | None = None) -> dict:
     client = GameClient(SERVER_URL)
     session = client.create_session(
         mode="time_trial",
@@ -318,7 +405,8 @@ def run_one(policy, seed: int, run_idx: int, total_runs: int,
     if hasattr(policy, "reset"):
         policy.reset()
 
-    result = rest_run_policy(client, policy, duration=duration, hz=20.0)
+    result = rest_run_policy(client, policy, duration=duration, hz=20.0,
+                             frame_log_path=frame_log_path)
     print(f"    checkpoints={result['checkpoints_passed']}/{TARGET_CHECKPOINTS}  "
           f"crashes={result['crashes']}  escapes={result.get('escapes', 0)}  "
           f"steps={result['steps']}")
@@ -343,6 +431,11 @@ def main():
     ap.add_argument("--alpha",   type=float, default=0.7,
                     help="EMA smoothing alpha (1.0 = no smoothing)")
     ap.add_argument("--name",    default="bot", help="Player name prefix")
+    ap.add_argument("--log-frames", action="store_true",
+                    help="Write per-frame JSONL diagnostic log to "
+                         "benchmarks/<tag>_seed<S>_run<N>_frames.jsonl. "
+                         "Captures raw NN output, commanded action, sensors, "
+                         "escape state and event tags on cp/escape/crash.")
     args = ap.parse_args()
 
     weights = args.weights or f"nav_{args.tag}.npz"
@@ -363,6 +456,11 @@ def main():
 
         runs_out = []
         for i in range(args.runs):
+            frame_log_path = None
+            if args.log_frames:
+                frame_log_path = str(
+                    out_dir / f"{args.tag}_seed{seed}_run{i+1}_frames.jsonl"
+                )
             result = run_one(
                 policy=policy,
                 seed=seed,
@@ -370,7 +468,10 @@ def main():
                 total_runs=args.runs,
                 duration=args.duration,
                 player_name=args.name,
+                frame_log_path=frame_log_path,
             )
+            if frame_log_path:
+                print(f"  wrote frame log: {frame_log_path}")
             runs_out.append(result)
 
         summary = score_runs(runs_out, TARGET_CHECKPOINTS)
