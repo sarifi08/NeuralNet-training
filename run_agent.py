@@ -83,8 +83,11 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
         time.sleep(0.05)
 
     # ── Control loop ─────────────────────────────────────────────────────
-    STUCK_THRESHOLD = 30    # frames at speed < 0.3 before recovery kicks in (~1.5s)
-    RECOVERY_FRAMES = 25    # frames of reverse + counter-steer (~1.2s)
+    # Proper 3-point-turn escape (ported from auto_collect.py escape).
+    STUCK_THRESHOLD     = 30    # frames at speed<0.3 + wall in front (~1.5s)
+    ESCAPE_REV_FRAMES   = 30    # ~1.5s reverse with hard turn
+    ESCAPE_FWD_FRAMES   = 22    # ~1.1s forward with continuing turn
+    POST_ESCAPE_FRAMES  = 60    # ~3.0s of detour bias added to network steering
 
     interval = 1.0 / hz
     start = time.time()
@@ -95,8 +98,12 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
     last_pos = None
     stuck_streak = 0
     max_stuck = 0
-    recovery_counter = 0    # >0 means we're in recovery mode
-    last_policy_steering = 0.0
+    escape_rev = 0          # frames remaining of reverse phase
+    escape_fwd = 0          # frames remaining of forward phase
+    escape_dir = 0.0        # -1 (rotate left) / +1 (rotate right) for current escape
+    post_escape_dir    = 0.0
+    post_escape_frames = 0  # frames remaining of post-escape steering bias
+    escapes_triggered  = 0
     track = []
     next_log = start
 
@@ -144,24 +151,72 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
                 crashes += 1
         last_pos = pos
 
-        # Policy or stuck-recovery override
-        if recovery_counter > 0:
-            # Reverse with counter-steer to break free from obstacle
-            throttle = -0.6
-            steering = -last_policy_steering
-            recovery_counter -= 1
-            if recovery_counter == 0:
-                stuck_streak = 0
+        # Trigger a 3-point-turn escape if we're stuck against a wall and not
+        # already inside one.
+        if (escape_rev == 0 and escape_fwd == 0
+                and stuck_streak >= STUCK_THRESHOLD):
+            # Pick rotation direction by which forward arc has more clearance.
+            # left_score uses rays at +45/+90/+135; right uses -45/-90/-135.
+            # Whichever side is more open is the side we want the bot to face
+            # AFTER rotating.
+            try:
+                rs = list(rays)
+                left_score  = float(rs[1] + rs[2] + rs[3])
+                right_score = float(rs[5] + rs[6] + rs[7])
+            except Exception:
+                left_score = right_score = 1.0
+            escape_dir = -1.0 if left_score > right_score else +1.0
+            escape_rev = ESCAPE_REV_FRAMES
+            escapes_triggered += 1
+            stuck_streak = 0
+            if hasattr(policy_fn, "reset"):
+                policy_fn.reset()
+
+        if escape_rev > 0:
+            # Reverse + hard turn. Ackermann under reverse: steer = -escape_dir
+            # makes the FRONT swing toward escape_dir (i.e. rotates the bot
+            # toward the more-open side).
+            throttle = -0.7
+            steering = -float(escape_dir)
+            escape_rev -= 1
+            if escape_rev == 0:
+                escape_fwd = ESCAPE_FWD_FRAMES
+        elif escape_fwd > 0:
+            # Forward + continuing turn — completes the rotation in same
+            # direction so the bot ends up genuinely facing a new heading
+            # instead of right back at the wall it came from.
+            throttle = 0.7
+            steering = 0.7 * float(escape_dir)
+            escape_fwd -= 1
+            if escape_fwd == 0:
+                # Hand off to the network with a 3-second decaying detour
+                # bias so heading-pursuit doesn't immediately swing the bot
+                # back into the wall it just left.
+                post_escape_dir    = float(escape_dir)
+                post_escape_frames = POST_ESCAPE_FRAMES
                 if hasattr(policy_fn, "reset"):
                     policy_fn.reset()
-        elif stuck_streak >= STUCK_THRESHOLD:
-            # Trigger recovery
-            recovery_counter = RECOVERY_FRAMES
-            throttle = -0.6
-            steering = -last_policy_steering
-            stuck_streak = 0
         else:
             throttle, steering = policy_fn(state)
+
+            # Distance-aware steering boost. The network was trained on data
+            # where heading_error → steering correlation is -0.6, but its
+            # outputs get gentler as it approaches the checkpoint. Boost
+            # when close so we actually hit the cp instead of grazing past.
+            distance = float(nav.get("distance", 50.0))
+            if distance < 8.0:
+                steering = max(-1.0, min(1.0, steering * 1.5))
+            elif distance < 14.0:
+                steering = max(-1.0, min(1.0, steering * 1.2))
+
+            # Post-escape bias: push toward the side the escape committed to
+            # so the bot doesn't immediately swing back into the wall.
+            if post_escape_frames > 0:
+                decay = post_escape_frames / POST_ESCAPE_FRAMES
+                steering = max(-1.0, min(1.0,
+                                          steering + post_escape_dir * 0.45 * decay))
+                post_escape_frames -= 1
+
             last_policy_steering = steering
 
         try:
@@ -191,6 +246,7 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0)
         "elapsed": elapsed,
         "checkpoints_passed": checkpoints_passed,
         "crashes": crashes,
+        "escapes": escapes_triggered,
         "min_speed_streak": max(max_stuck, stuck_streak),
         "track": track,
     }
@@ -264,7 +320,8 @@ def run_one(policy, seed: int, run_idx: int, total_runs: int,
 
     result = rest_run_policy(client, policy, duration=duration, hz=20.0)
     print(f"    checkpoints={result['checkpoints_passed']}/{TARGET_CHECKPOINTS}  "
-          f"crashes={result['crashes']}  steps={result['steps']}")
+          f"crashes={result['crashes']}  escapes={result.get('escapes', 0)}  "
+          f"steps={result['steps']}")
 
     client.disconnect_ws()
     try:
