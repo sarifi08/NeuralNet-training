@@ -12,6 +12,10 @@ nav_*.npz
 fig_*.png
 fig_*.jpg
 *.pt
+# Per-frame diagnostic JSONLs are huge and only useful while debugging
+# the run that produced them. The benchmarks/<tag>.json summaries are
+# the canonical record of each iteration.
+benchmarks/*_frames.jsonl
 
 # IDE
 .vscode/
