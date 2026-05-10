@@ -119,6 +119,14 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
     post_escape_dir    = 0.0
     post_escape_frames = 0  # frames remaining of post-escape steering bias
     escapes_triggered  = 0
+    # Track whether the CURRENT escape is actually moving the bot, and what
+    # the previous escape's outcome was. If the previous escape did not
+    # produce ANY motion (max sp during that escape stayed below 0.3), the
+    # next escape forces the opposite direction even when the rays say
+    # otherwise — because the rays already said this and it didn't work.
+    escape_motion_seen   = False  # any sp >= 0.3 during the current escape?
+    last_escape_dir      = 0.0    # the direction the previous escape used
+    last_escape_succeeded = True  # True until we observe a failed escape
     track = []
     next_log = start
     next_status = start
@@ -210,15 +218,30 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
                     right_score = float(rs[5] + rs[6] + rs[7])
                 except Exception:
                     left_score = right_score = 1.0
-                escape_dir = -1.0 if left_score > right_score else +1.0
+                geom_dir = -1.0 if left_score > right_score else +1.0
+                # If the LAST escape didn't move the bot AND the geometry
+                # picked the same direction again, force the opposite. The
+                # rays haven't changed (we haven't moved), so the choice is
+                # the same — but we already know it doesn't work.
+                forced_flip = False
+                if (not last_escape_succeeded
+                        and last_escape_dir != 0.0
+                        and geom_dir == last_escape_dir):
+                    escape_dir = -last_escape_dir
+                    forced_flip = True
+                else:
+                    escape_dir = geom_dir
                 escape_rev = ESCAPE_REV_FRAMES
                 escapes_triggered += 1
                 stuck_streak = 0
-                escape_event_meta = (left_score, right_score, sp, front_arc_min)
+                escape_motion_seen = False
+                escape_event_meta = (left_score, right_score, sp, front_arc_min,
+                                     forced_flip)
                 if print_status:
+                    flip_tag = " (FLIP, prev escape failed)" if forced_flip else ""
                     print(f"  [ESCAPE TRIGGER t={time.time()-start:5.1f}s "
                           f"dir={int(escape_dir):+d} L={left_score:.1f} R={right_score:.1f} "
-                          f"sp={sp:.2f} front={front_arc_min:.1f}m]")
+                          f"sp={sp:.2f} front={front_arc_min:.1f}m]{flip_tag}")
                 if hasattr(policy_fn, "reset"):
                     policy_fn.reset()
 
@@ -232,6 +255,11 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
                 steering = -float(escape_dir)
                 escape_rev -= 1
                 phase = "esc_rev"
+                # Track whether the bot is actually moving during this escape.
+                # If sp ever exceeds 0.3, the escape is doing something useful;
+                # otherwise it's pinned and the next trigger should flip dir.
+                if sp >= 0.3:
+                    escape_motion_seen = True
                 if escape_rev == 0:
                     escape_fwd = ESCAPE_FWD_FRAMES
             elif escape_fwd > 0:
@@ -239,7 +267,12 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
                 steering = 0.7 * float(escape_dir)
                 escape_fwd -= 1
                 phase = "esc_fwd"
+                if sp >= 0.3:
+                    escape_motion_seen = True
                 if escape_fwd == 0:
+                    # Record outcome of this escape for the next-trigger logic.
+                    last_escape_dir       = float(escape_dir)
+                    last_escape_succeeded = escape_motion_seen
                     post_escape_dir    = float(escape_dir)
                     post_escape_frames = POST_ESCAPE_FRAMES
                     if hasattr(policy_fn, "reset"):
@@ -307,8 +340,10 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
                 if cp_event_dist is not None:
                     event = f"cp_hit:{checkpoints_passed}:close_pass={cp_event_dist:.2f}m"
                 elif escape_event_meta is not None:
-                    L, R, esc_sp, esc_front = escape_event_meta
-                    event = f"escape:dir={int(escape_dir):+d}:L={L:.1f}:R={R:.1f}:front={esc_front:.1f}"
+                    L, R, esc_sp, esc_front, flipped = escape_event_meta
+                    flip_str = ":flip" if flipped else ""
+                    event = (f"escape:dir={int(escape_dir):+d}:L={L:.1f}:R={R:.1f}"
+                             f":front={esc_front:.1f}{flip_str}")
                 elif crash_event:
                     event = f"crash:total={crashes}"
                 row = {
