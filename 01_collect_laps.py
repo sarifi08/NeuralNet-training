@@ -1,7 +1,7 @@
 """Manual data collection — full laps only.
 
 Single-purpose collector for Phase 4 (DAgger / data-coverage fix). Records
-your driving for N minutes with ONE instruction: complete the 8-checkpoint
+your driving for N minutes with ONE instruction: complete the 12-checkpoint
 loop. No recovery phase, no deliberate-crash phase — those introduce the
 reverse + hard-steer frames we have to filter out anyway.
 
@@ -62,7 +62,7 @@ def main():
     print(f"    {session.get('browser_url')}")
     print()
     print(f"  When ready: drive {args.minutes:.1f} minutes on seed {args.seed}.")
-    print(f"  GOAL: complete the 8-checkpoint loop as many times as you can.")
+    print(f"  GOAL: complete the 12-checkpoint loop as many times as you can.")
     print(f"  Smooth, deliberate driving. No deliberate crashes.")
     input("\n  Press Enter once the browser tab has focus and you can see the bot.  ")
 
