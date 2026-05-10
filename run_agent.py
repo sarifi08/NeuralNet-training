@@ -166,15 +166,25 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
             # Without this check, mud / ice / sand (where speed naturally drops
             # to 0.1-0.3 even when accelerating forward) triggers spurious
             # reverses, sabotaging the trained network's correct mud behaviour.
+            #
+            # ALSO gated on (escape_rev == 0 and escape_fwd == 0): if we keep
+            # incrementing stuck_streak while the escape itself is running,
+            # a wedge-pocket where escape can't actually displace the bot
+            # leaves stuck_streak >= STUCK_THRESHOLD the moment escape ends,
+            # so the trigger fires again on the very next frame and the bot
+            # gets pinned in an infinite escape loop. (We saw exactly this
+            # for 22s in the seed-42 v12 run.)
             sp = sensors["speed"]
             rays = sensors.get("rays", [50.0] * 8)
             front_arc_min = float(min(rays[0], rays[1], rays[7]))
             wall_in_front = front_arc_min < 5.0
-            if sp < 0.3 and wall_in_front:
-                stuck_streak += 1
-            else:
-                max_stuck = max(max_stuck, stuck_streak)
-                stuck_streak = 0
+            in_escape = escape_rev > 0 or escape_fwd > 0
+            if not in_escape:
+                if sp < 0.3 and wall_in_front:
+                    stuck_streak += 1
+                else:
+                    max_stuck = max(max_stuck, stuck_streak)
+                    stuck_streak = 0
 
             # Crash detection — position teleport > 5 m
             pos = sensors["position"]
