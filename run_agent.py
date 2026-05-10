@@ -106,6 +106,8 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
     steps = 0
     checkpoints_passed = 0
     last_cp_idx: int | None = None
+    prev_distance: float | None = None  # nav.distance from PREVIOUS frame, used to
+                                        # report close-pass distance on cp events
     crashes = 0
     last_crashes = 0
     last_pos = None
@@ -142,16 +144,22 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
             # Checkpoint tracking via checkpoint_index increments
             nav = sensors["navigation"]
             cp_idx = nav.get("checkpoint_index", 0)
+            current_distance = float(nav.get("distance", -1.0))
             cp_event_dist = None
             if last_cp_idx is None:
                 last_cp_idx = cp_idx
             elif cp_idx != last_cp_idx:
                 delta = (cp_idx - last_cp_idx) % TARGET_CHECKPOINTS
                 checkpoints_passed += delta
-                cp_event_dist = float(nav.get("distance", -1.0))
+                # Use the PREVIOUS frame's distance — current_distance has
+                # already updated to point at the next cp. Previous frame is
+                # the last reading where the cp we just hit was still target,
+                # so its distance is the actual close-pass distance.
+                cp_event_dist = (prev_distance if prev_distance is not None
+                                 else current_distance)
                 if print_status:
                     print(f"  [CP HIT cp={checkpoints_passed} t={time.time()-start:5.1f}s "
-                          f"d_at_hit={cp_event_dist:.1f}m]")
+                          f"close_pass={cp_event_dist:.2f}m]")
                 last_cp_idx = cp_idx
 
             # Stuck heuristic — REQUIRES a wall in front, not just low speed.
@@ -287,7 +295,7 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
             if log_fp is not None:
                 event = None
                 if cp_event_dist is not None:
-                    event = f"cp_hit:{checkpoints_passed}@{cp_event_dist:.2f}m"
+                    event = f"cp_hit:{checkpoints_passed}:close_pass={cp_event_dist:.2f}m"
                 elif escape_event_meta is not None:
                     L, R, esc_sp, esc_front = escape_event_meta
                     event = f"escape:dir={int(escape_dir):+d}:L={L:.1f}:R={R:.1f}:front={esc_front:.1f}"
@@ -316,6 +324,11 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
                 if event is not None:
                     row["event"] = event
                 log_fp.write(json.dumps(row) + "\n")
+
+            # Remember this frame's distance so the next-frame cp-hit print
+            # can report the close-pass distance, not the distance to the
+            # next checkpoint.
+            prev_distance = current_distance
 
             elapsed_step = time.time() - step_start
             sleep_for = interval - elapsed_step
