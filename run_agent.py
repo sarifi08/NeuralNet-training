@@ -295,6 +295,13 @@ def rest_run_policy(client, policy_fn, duration: float = 60.0, hz: float = 20.0,
                     steering = max(-1.0, min(1.0, steering * 1.2))
                     phase = "drive_boost1.2"
 
+                # Safety limiter: slow down when misaligned or very close to obstacles.
+                he = float(nav.get("heading_error", 0.0))
+                if front_arc_min < 8.0 or abs(he) > 1.2:
+                    throttle = min(throttle, 0.4)
+                if front_arc_min < 5.0:
+                    throttle = min(throttle, 0.2)
+
                 if post_escape_frames > 0:
                     decay = post_escape_frames / POST_ESCAPE_FRAMES
                     steering = max(-1.0, min(1.0,

@@ -26,7 +26,8 @@ PHASES = [
     ("Tight turns",       60, "Slow before each corner, take it cleanly."),
     ("Obstacle clusters", 60, "Brake when the front ray gets short, steer around."),
     ("Bad terrain",       60, "Drive deliberate lines on ice / mud / sand."),
-    ("Recovery",          60, "Drive into walls, get stuck, back out, turn around. DO NOT SKIP."),
+    ("Low-speed recovery", 90, "Crawl, stop, reverse, turn-in-place, recover at low speed."),
+    ("Recovery",          90, "Drive into walls, get stuck, back out, turn around. DO NOT SKIP."),
 ]
 
 
