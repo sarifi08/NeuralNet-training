@@ -56,7 +56,7 @@ def main():
     session = client.create_session(
         mode="time_trial",
         player_name=f"laps_{args.tag}",
-        config={"seed": args.seed, "wind_enabled": False},
+        config={"seed": args.seed, "wind_enabled": False, "obstacles_enabled": True},
     )
     print("\n  Open this URL in a NEW tab and click into it so WASD reach the game:")
     print(f"    {session.get('browser_url')}")

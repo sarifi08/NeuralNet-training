@@ -20,7 +20,6 @@ from pathlib import Path
 
 import numpy as np
 
-from drive2win.benchmark import run_benchmark as _run_benchmark
 from drive2win import viz
 
 
@@ -47,132 +46,131 @@ def main():
     weights = args.weights or f"nav_{args.tag}.npz"
     out_dir = Path("benchmarks"); out_dir.mkdir(exist_ok=True)
 
-    if args.no_obstacles:
-        from game_client import GameClient as _GC
-        import time as _time
-        from drive2win.benchmark import make_mlp_policy, make_module_policy, score_runs
-        from drive2win.eval import run_policy
+    from game_client import GameClient as _GC
+    import time as _time
+    from drive2win.benchmark import make_mlp_policy, make_module_policy, score_runs
+    from drive2win.eval import run_policy
 
-        def _with_escape(base_policy, stuck_threshold=20, escape_frames=30):
-            """Wrap a policy with stuck-detection + reverse escape logic."""
-            state = {"stuck": 0, "escaping": 0, "escape_dir": 1.0}
+    def _with_escape(base_policy, stuck_threshold=20, escape_frames=30):
+        state = {"stuck": 0, "escaping": 0, "escape_dir": 1.0}
 
-            def policy(obs):
-                sp = (obs.get("sensors") or {}).get("speed", 0.0)
-                if state["escaping"] > 0:
-                    state["escaping"] -= 1
-                    if state["escaping"] == 0:
-                        state["escape_dir"] *= -1.0  # flip direction next time
-                    return -1.0, state["escape_dir"] * 0.6
-                if sp < 0.3:
-                    state["stuck"] += 1
-                    if state["stuck"] >= stuck_threshold:
-                        state["stuck"] = 0
-                        state["escaping"] = escape_frames
-                        return -1.0, state["escape_dir"] * 0.6
-                else:
+        def policy(obs):
+            sp = (obs.get("sensors") or {}).get("speed", 0.0)
+            if state["escaping"] > 0:
+                state["escaping"] -= 1
+                if state["escaping"] == 0:
+                    state["escape_dir"] *= -1.0
+                return -1.0, state["escape_dir"] * 0.6
+            if sp < 0.3:
+                state["stuck"] += 1
+                if state["stuck"] >= stuck_threshold:
                     state["stuck"] = 0
-                return base_policy(obs)
+                    state["escaping"] = escape_frames
+                    return -1.0, state["escape_dir"] * 0.6
+            else:
+                state["stuck"] = 0
+            return base_policy(obs)
 
-            return policy
+        return policy
 
-        def _with_checkpoint_precision(base_policy, approach_dist=25.0, heading_k=0.7,
-                                       speed_dist=12.0, speed_target=2.0, throttle_floor=0.2,
-                                       near_miss_dist=6.0, near_miss_climb=4.0,
-                                       near_miss_frames=25):
-            """Near checkpoints: heading correction (A), speed control (B), near-miss recovery (C)."""
-            st = {
-                "min_dist": 999.0,
-                "prev_dist": 999.0,
-                "cp_count": 0,
-                "recovering": 0,
-            }
+    def _with_checkpoint_precision(base_policy, approach_dist=25.0, heading_k=0.7,
+                                   speed_dist=12.0, speed_target=2.0, throttle_floor=0.2,
+                                   near_miss_dist=6.0, near_miss_climb=4.0,
+                                   near_miss_frames=25):
+        st = {
+            "min_dist": 999.0, "prev_dist": 999.0,
+            "cp_count": 0, "recovering": 0,
+            "retries": 0, "cooldown": 0,
+        }
 
-            def policy(obs):
-                sensors = obs.get("sensors") or {}
-                nav = sensors.get("navigation") or {}
-                dist = sensors.get("checkpoint_distance", 999.0)
-                cp_count = nav.get("checkpoints_completed", 0) or 0
+        def policy(obs):
+            sensors = obs.get("sensors") or {}
+            nav = sensors.get("navigation") or {}
+            dist = sensors.get("checkpoint_distance", 999.0)
+            cp_count = nav.get("checkpoints_completed", 0) or 0
 
-                # reset per-checkpoint tracking when a new cp is registered
-                if cp_count != st["cp_count"]:
-                    st["cp_count"] = cp_count
-                    st["min_dist"] = 999.0
-                    st["recovering"] = 0
+            if cp_count != st["cp_count"]:
+                st["cp_count"] = cp_count
+                st["min_dist"] = 999.0
+                st["recovering"] = 0
+                st["retries"] = 0
+                st["cooldown"] = 0
 
-                st["min_dist"] = min(st["min_dist"], dist)
+            st["min_dist"] = min(st["min_dist"], dist)
+            if st["cooldown"] > 0:
+                st["cooldown"] -= 1
 
-                # C — near-miss recovery: was very close, now moving away, no cp scored
-                near_miss = (
-                    st["min_dist"] < near_miss_dist
-                    and dist > st["min_dist"] + near_miss_climb
-                    and st["recovering"] == 0
+            near_miss = (
+                st["min_dist"] < near_miss_dist
+                and dist > st["min_dist"] + near_miss_climb
+                and st["recovering"] == 0
+                and st["cooldown"] == 0
+                and st["retries"] < 2
+            )
+            st["prev_dist"] = dist
+
+            if near_miss:
+                st["retries"] += 1
+                st["recovering"] = near_miss_frames
+                st["cooldown"] = near_miss_frames * 3  # suppress re-trigger after recovery
+                st["min_dist"] = 999.0
+
+            if st["recovering"] > 0:
+                st["recovering"] -= 1
+                heading_err = sensors.get("heading_error", 0.0)
+                steer = float(np.clip(heading_err * 0.8, -1.0, 1.0))
+                return -0.8, steer
+
+            throttle, steering = base_policy(obs)
+
+            if dist <= approach_dist:
+                heading_err = sensors.get("heading_error", 0.0)
+                blend = 1.0 - (dist / approach_dist)
+                steering = float(np.clip(
+                    steering - heading_k * blend * heading_err, -1.0, 1.0
+                ))
+            if dist <= speed_dist:
+                speed = sensors.get("speed", 0.0)
+                throttle = float(np.clip(
+                    0.25 * (speed_target - speed), throttle_floor, 0.6
+                ))
+            return throttle, steering
+
+        return policy
+
+    def _runner(weights, runs, seed, duration, module):
+        base = make_module_policy(module, weights) if module else make_mlp_policy(weights)
+        policy = _with_escape(_with_checkpoint_precision(base))
+        obstacles = not args.no_obstacles
+        obs_label = "with obstacles" if obstacles else "no obstacles"
+        client = _GC("https://ml.ferit.tech", "None")
+        runs_out = []
+        try:
+            for i in range(runs):
+                session = client.create_session(
+                    mode="time_trial",
+                    player_name=f"benchmark_run{i+1}",
+                    config={"seed": seed, "wind_enabled": False,
+                            "obstacles_enabled": obstacles},
                 )
-                st["prev_dist"] = dist
-
-                if near_miss:
-                    st["recovering"] = near_miss_frames
-                    st["min_dist"] = 999.0  # reset so it doesn't re-trigger immediately
-
-                if st["recovering"] > 0:
-                    st["recovering"] -= 1
-                    heading_err = sensors.get("heading_error", 0.0)
-                    # reverse and steer front of car back toward checkpoint
-                    steer = float(np.clip(heading_err * 0.8, -1.0, 1.0))
-                    return -0.8, steer
-
-                throttle, steering = base_policy(obs)
-
-                # A — heading correction, active within approach_dist
-                if dist <= approach_dist:
-                    heading_err = sensors.get("heading_error", 0.0)
-                    blend = 1.0 - (dist / approach_dist)
-                    steering = float(np.clip(
-                        steering - heading_k * blend * heading_err, -1.0, 1.0
-                    ))
-                # B — speed control, active only within speed_dist
-                if dist <= speed_dist:
-                    speed = sensors.get("speed", 0.0)
-                    speed_err = speed_target - speed
-                    throttle = float(np.clip(
-                        0.25 * speed_err, throttle_floor, 0.6
-                    ))
-                return throttle, steering
-
-            return policy
-
-        def _runner(weights, runs, seed, duration, module):
-            base = make_module_policy(module, weights) if module else make_mlp_policy(weights)
-            policy = _with_escape(_with_checkpoint_precision(base))
-            client = _GC("https://ml.ferit.tech", "None")
-            runs_out = []
-            try:
-                for i in range(runs):
-                    session = client.create_session(
-                        mode="time_trial",
-                        player_name=f"benchmark_run{i+1}",
-                        config={"seed": seed, "wind_enabled": False, "obstacles_enabled": False},
-                    )
-                    client.connect_ws()
-                    _time.sleep(0.6)
-                    print(f"\n  run {i+1}/{runs}  session={session['session_id'][:8]}… [no obstacles]")
-                    result = run_policy(client, policy, duration=duration, hz=20.0)
-                    print(f"    checkpoints={result['checkpoints_passed']}/12  "
-                          f"crashes={result['crashes']}  steps={result['steps']}")
-                    runs_out.append(result)
-                    client.disconnect_ws()
-                    try: client.delete_session()
-                    except Exception: pass
-            finally:
-                try: client.disconnect_ws()
+                client.connect_ws()
+                _time.sleep(0.6)
+                print(f"\n  run {i+1}/{runs}  session={session['session_id'][:8]}… [{obs_label}]")
+                result = run_policy(client, policy, duration=duration, hz=20.0)
+                print(f"    checkpoints={result['checkpoints_passed']}/12  "
+                      f"crashes={result['crashes']}  steps={result['steps']}")
+                runs_out.append(result)
+                client.disconnect_ws()
+                try: client.delete_session()
                 except Exception: pass
-            summary = score_runs(runs_out, 12)
-            return {"summary": summary, "runs": runs_out, "config": {
-                "weights": weights, "module": module, "seed": seed,
-                "runs": runs, "duration": duration, "obstacles_enabled": False,
-            }}
-    else:
-        _runner = _run_benchmark
+        finally:
+            try: client.disconnect_ws()
+            except Exception: pass
+        summary = score_runs(runs_out, 12)
+        return {"summary": summary, "runs": runs_out, "config": {
+            "weights": weights, "module": module, "seed": seed,
+            "runs": runs, "duration": duration, "obstacles_enabled": obstacles,
+        }}
 
     all_results = []
     for seed in args.seeds:
