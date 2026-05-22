@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 H1, H2 = 64, 32
-N_IN, N_OUT = 12, 2
+N_IN, N_OUT = 13, 2
 
 
 # ── Forward pass ────────────────────────────────────────────────────────

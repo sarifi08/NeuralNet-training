@@ -43,6 +43,20 @@ def _poll_positions(client, stop_evt, out, hz=5.0):
         time.sleep(interval)
 
 
+def _poll_checkpoints(client, stop_evt, out, hz=20.0):
+    """Poll checkpoints_completed at the same rate as the server recording."""
+    interval = 1.0 / hz
+    while not stop_evt.is_set():
+        try:
+            st = client.get_latest_state()
+            if st:
+                nav = (st.get("sensors") or {}).get("navigation") or {}
+                out.append(float(nav.get("checkpoints_completed", 0) or 0))
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag",     default="v12_human")
@@ -70,10 +84,14 @@ def main():
     time.sleep(0.5)
 
     positions: list = []
+    checkpoints: list = []
     stop_evt = threading.Event()
-    t = threading.Thread(target=_poll_positions, args=(client, stop_evt, positions),
-                         daemon=True)
-    t.start()
+    t_pos = threading.Thread(target=_poll_positions, args=(client, stop_evt, positions),
+                             daemon=True)
+    t_cp  = threading.Thread(target=_poll_checkpoints, args=(client, stop_evt, checkpoints),
+                             daemon=True)
+    t_pos.start()
+    t_cp.start()
 
     client.start_recording(sample_rate=20)
     print(f"\n  Recording {args.minutes:.1f} minutes — drive now.")
@@ -89,11 +107,24 @@ def main():
     print(f"  states  : {states.shape}")
     print(f"  actions : {actions.shape}")
 
+    # Stitch checkpoints_completed as 13th feature.
+    # Polling runs at 20 Hz alongside the server recording — trim or pad to match.
+    if len(states) > 0 and len(checkpoints) > 0:
+        cp_arr = np.array(checkpoints, dtype=np.float32)
+        n = len(states)
+        if len(cp_arr) >= n:
+            cp_arr = cp_arr[:n]
+        else:
+            cp_arr = np.pad(cp_arr, (0, n - len(cp_arr)), mode='edge')
+        states = np.hstack([states, cp_arr[:, None]])
+        print(f"  states+cp: {states.shape}  (13 features)")
+
     if len(states) > 0:
         corr = np.corrcoef(states[:, 1], actions[:, 1])[0, 1]
         print(f"  heading→steer correlation: {corr:+.3f}  (target: < -0.4)")
         print(f"  steering std:  {actions[:,1].std():.3f}  (target: > 0.3)")
         print(f"  throttle mean: {actions[:,0].mean():+.3f}")
+        print(f"  cp range: {states[:, 12].min():.0f}–{states[:, 12].max():.0f}")
 
     pos_arr = np.array([(p[1], p[2]) for p in positions], dtype=np.float32)
 
