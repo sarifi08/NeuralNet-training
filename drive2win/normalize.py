@@ -30,10 +30,9 @@ FEATURE_NAMES = [
     "ray_6_-90",
     "ray_7_-45",
     "ground_friction",
-    "checkpoints_completed",
 ]
 ACTION_NAMES = ["throttle", "steering"]
-N_FEATURES = 13
+N_FEATURES = 12
 N_ACTIONS = 2
 
 
@@ -53,18 +52,15 @@ def normalize_states(states_raw: np.ndarray) -> np.ndarray:
     s[:, 2] = np.clip(s[:, 2] / DIST_MAX, 0.0, 1.0)         # ckpt distance
     s[:, 3:11] = np.clip(s[:, 3:11] / RAY_MAX, 0.0, 1.0)    # 8 rays
     # column 11 (friction) is already in [0, 1]
-    s[:, 12] = np.clip(s[:, 12] / 12.0, 0.0, 1.0)           # checkpoints_completed (0-12)
     return s
 
 
 def sensors_to_input(sensors: dict) -> np.ndarray:
     """Convert a live sensor dict (from `client.get_sensors()` or the WS
-    `state['sensors']`) to the normalized 13-vector the network expects.
+    `state['sensors']`) to the normalized 12-vector the network expects.
 
-    Returns shape (13,), float32.
+    Returns shape (12,), float32.
     """
-    nav = sensors.get("navigation") or {}
-    cp = float(nav.get("checkpoints_completed", 0) or 0)
     raw = np.array(
         [
             sensors["speed"],
@@ -72,7 +68,6 @@ def sensors_to_input(sensors: dict) -> np.ndarray:
             sensors["checkpoint_distance"],
             *sensors["rays"],
             sensors["ground_friction"],
-            cp,
         ],
         dtype=np.float32,
     )
