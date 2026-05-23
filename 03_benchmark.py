@@ -49,6 +49,7 @@ def main():
     from game_client import GameClient as _GC
     import time as _time
     from drive2win.benchmark import make_mlp_policy, make_module_policy, score_runs
+    from drive2win.eval import run_policy
 
     def _with_escape(base_policy, stuck_threshold=20, escape_frames=30):
         state = {"stuck": 0, "escaping": 0, "escape_dir": 1.0}
@@ -137,131 +138,31 @@ def main():
 
         return policy
 
-    def _run_with_restart(client, make_fresh_policy, total_duration, seed,
-                          obstacles, stuck_timeout=8.0, hz=20.0):
-        """Run one episode with automatic session restart when permanently stuck.
-
-        If speed stays below 0.1 for stuck_timeout seconds the current session
-        is torn down and a new one is created from the start position.
-        Checkpoints collected before the restart are carried forward so the
-        final count reflects the whole run.
-        """
-        interval = 1.0 / hz
-        stuck_limit = int(stuck_timeout * hz)
-
-        total_cps = 0
-        total_crashes = 0
-        total_steps = 0
-        wall_start = _time.time()
-        track = []
-        remaining = total_duration
-        restart_count = 0
-
-        while remaining > 5.0:
-            session = client.create_session(
-                mode="time_trial",
-                player_name="benchmark_run",
-                config={"seed": seed, "wind_enabled": False,
-                        "obstacles_enabled": obstacles},
-            )
-            client.connect_ws()
-            _time.sleep(0.6)
-
-            policy = make_fresh_policy()
-            stuck_frames = 0
-            sub_cps = 0
-            last_pos = None
-            sub_crashes = 0
-            sub_start = _time.time()
-            next_log = sub_start
-            restarted = False
-
-            while _time.time() - sub_start < remaining:
-                state = client.get_latest_state()
-                if not state or "sensors" not in state:
-                    _time.sleep(interval)
-                    continue
-
-                sensors = state["sensors"]
-                sp = sensors.get("speed", 0.0)
-                nav = (sensors.get("navigation") or {})
-                cp = nav.get("checkpoints_completed", 0) or 0
-                sub_cps = max(sub_cps, cp)
-
-                pos = state.get("position") or {}
-                if last_pos:
-                    dx = pos.get("x", 0) - last_pos.get("x", 0)
-                    dz = pos.get("z", 0) - last_pos.get("z", 0)
-                    if dx * dx + dz * dz > 25.0:
-                        sub_crashes += 1
-                last_pos = pos
-
-                stuck_frames = stuck_frames + 1 if sp < 0.1 else 0
-
-                if stuck_frames >= stuck_limit:
-                    restart_count += 1
-                    secs_left = remaining - (_time.time() - sub_start)
-                    print(f"    [restart #{restart_count}] stuck {stuck_timeout:.0f}s — "
-                          f"banked {total_cps + sub_cps} cps, "
-                          f"{secs_left:.0f}s remaining")
-                    restarted = True
-                    break
-
-                throttle, steering = policy(state)
-                client.send_control_ws(throttle, steering)
-                total_steps += 1
-
-                now = _time.time()
-                if now >= next_log:
-                    track.append({"t": now - wall_start, "position": pos, "speed": sp})
-                    next_log = now + 1.0
-
-                _time.sleep(interval)
-
-            sub_elapsed = _time.time() - sub_start
-            remaining -= sub_elapsed
-            total_cps += sub_cps
-            total_crashes += sub_crashes
-
-            client.disconnect_ws()
-            try: client.delete_session()
-            except Exception: pass
-
-            if not restarted:
-                break  # finished naturally, don't loop again
-
-        return {
-            "checkpoints_passed": total_cps,
-            "crashes": total_crashes,
-            "steps": total_steps,
-            "elapsed": _time.time() - wall_start,
-            "track": track,
-        }
-
     def _runner(weights, runs, seed, duration, module):
+        base = make_module_policy(module, weights) if module else make_mlp_policy(weights)
+        policy = _with_escape(_with_checkpoint_precision(base))
         obstacles = not args.no_obstacles
         obs_label = "with obstacles" if obstacles else "no obstacles"
         client = _GC("https://ml.ferit.tech", "None")
-
-        def _make_policy():
-            base = make_module_policy(module, weights) if module else make_mlp_policy(weights)
-            return _with_escape(_with_checkpoint_precision(base))
-
         runs_out = []
         try:
             for i in range(runs):
-                print(f"\n  run {i+1}/{runs}  [{obs_label}]")
-                result = _run_with_restart(
-                    client=client,
-                    make_fresh_policy=_make_policy,
-                    total_duration=duration,
-                    seed=seed,
-                    obstacles=obstacles,
-                    stuck_timeout=8.0,
+                session = client.create_session(
+                    mode="time_trial",
+                    player_name=f"benchmark_run{i+1}",
+                    config={"seed": seed, "wind_enabled": False,
+                            "obstacles_enabled": obstacles},
                 )
+                client.connect_ws()
+                _time.sleep(0.6)
+                print(f"\n  run {i+1}/{runs}  session={session['session_id'][:8]}… [{obs_label}]")
+                result = run_policy(client, policy, duration=duration, hz=20.0)
                 print(f"    checkpoints={result['checkpoints_passed']}/12  "
                       f"crashes={result['crashes']}  steps={result['steps']}")
                 runs_out.append(result)
+                client.disconnect_ws()
+                try: client.delete_session()
+                except Exception: pass
         finally:
             try: client.disconnect_ws()
             except Exception: pass
