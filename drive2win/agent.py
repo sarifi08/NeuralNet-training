@@ -15,11 +15,18 @@ from .normalize import sensors_to_input, clip_action
 
 
 def make_policy(weights_path: str):
-    """Load MLP weights and return a fully-wrapped tournament policy."""
+    """Load MLP weights and return a fully-wrapped tournament policy.
+
+    Supports both 12-feature (legacy) and 13-feature (checkpoint-aware) models
+    by inspecting W1.shape at load time.
+    """
     w = nn_mod.load(weights_path)
+    n_in = w["W1"].shape[0]  # 12 = legacy, 13 = checkpoint-aware
 
     def base_policy(obs):
-        x = sensors_to_input(obs["sensors"])
+        x = sensors_to_input(obs["sensors"])  # always 13 features
+        if n_in == 12:
+            x = x[:12]  # old weights don't have the checkpoint input
         return clip_action(nn_mod.forward(x, w))
 
     return _with_escape(_with_checkpoint_precision(base_policy))
