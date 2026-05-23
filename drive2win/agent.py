@@ -29,10 +29,58 @@ def make_policy(weights_path: str):
             x = x[:12]  # old weights don't have the checkpoint input
         return clip_action(nn_mod.forward(x, w))
 
-    return _with_escape(_with_checkpoint_precision(base_policy))
+    return _with_escape(_with_obstacle_avoidance(_with_checkpoint_precision(base_policy)))
 
 
 # ── Wrappers ─────────────────────────────────────────────────────────────────
+
+def _with_obstacle_avoidance(base_policy, danger_dist=5.0, warn_dist=12.0,
+                             steer_strength=0.6, brake_throttle=0.35):
+    """Proactive obstacle avoidance using raycasts.
+
+    Checks front/front-diagonal rays every frame. If an obstacle is within
+    danger_dist, overrides steering toward the clearer side and reduces
+    throttle. Acts before the bot hits anything, unlike the escape wrapper
+    which only fires after the bot is already stuck.
+
+    Ray layout (45° apart, clockwise from front):
+        0=front  1=FR  2=R  3=BR  4=back  5=BL  6=L  7=FL
+    """
+    def policy(obs):
+        throttle, steering = base_policy(obs)
+        if throttle <= 0:
+            return throttle, steering
+
+        sensors = obs.get("sensors") or {}
+        rays = sensors.get("rays") or [50.0] * 8
+
+        front = rays[0]
+        front_r = rays[1]   # front-right (+45°)
+        front_l = rays[7]   # front-left  (-45°)
+
+        # Nothing close — pass through unchanged
+        if front >= warn_dist and front_r >= warn_dist and front_l >= warn_dist:
+            return throttle, steering
+
+        if front < danger_dist or front_r < danger_dist or front_l < danger_dist:
+            # Hard dodge: steer away from whichever side is closer
+            if front_r < front_l:
+                steering = float(np.clip(steering - steer_strength, -1.0, 1.0))
+            else:
+                steering = float(np.clip(steering + steer_strength, -1.0, 1.0))
+            throttle = min(throttle, brake_throttle)
+        else:
+            # Soft nudge in the warn zone
+            blend = 1.0 - (min(front, front_r, front_l) - danger_dist) / (warn_dist - danger_dist)
+            if front_r < front_l:
+                steering = float(np.clip(steering - steer_strength * blend * 0.5, -1.0, 1.0))
+            else:
+                steering = float(np.clip(steering + steer_strength * blend * 0.5, -1.0, 1.0))
+
+        return throttle, steering
+
+    return policy
+
 
 def _with_escape(base_policy, stuck_threshold=20, escape_frames=30):
     """Reverse out of stuck states. Alternates escape direction on each use."""
